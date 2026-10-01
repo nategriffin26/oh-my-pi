@@ -326,6 +326,10 @@ export class UiHelpers {
 				this.ctx.chatContainer.addChild(assistantComponent);
 				break;
 			}
+			case "clmNote": {
+				// Projection-only context, not an executed transcript event. Inspect via /context show.
+				break;
+			}
 			case "toolResult": {
 				// Tool results are rendered inline with tool calls, handled separately
 				break;

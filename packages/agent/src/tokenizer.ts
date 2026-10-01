@@ -1,10 +1,12 @@
 import type { Model } from "@oh-my-pi/pi-ai";
 import type { ModelTokenizer } from "@oh-my-pi/pi-catalog/types";
 import * as natives from "@oh-my-pi/pi-natives";
-import { materializeString, stringifyJson } from "@oh-my-pi/pi-utils";
+import { escapeXmlText, materializeString, prompt, stringifyJson } from "@oh-my-pi/pi-utils";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import * as snapcompact from "@oh-my-pi/snapcompact";
 import { isEstimateCacheable, messageEstimateVersion } from "./compaction/message-cache";
+import { isClmRewriteMarker } from "./compaction/messages";
+import clmNoteContextPrompt from "./compaction/prompts/clm-note-context.md" with { type: "text" };
 import type { AgentMessage } from "./types";
 
 const testEnv = Bun.env.NODE_ENV === "test";
@@ -150,6 +152,16 @@ interface MessageEstimate {
 	floored?: number;
 }
 
+/** Construction options for {@link Tokenizer}. */
+export interface TokenizerOptions {
+	/**
+	 * Count models without a catalog tokenizer with native o200k_base instead of
+	 * the bytes/4 heuristic. Capacity gates opt in: the heuristic misses dense
+	 * content (JSON, hashes, base64) by 1.4–2.7×. Tests keep the heuristic.
+	 */
+	nativeFallback?: boolean;
+}
+
 /**
  * Model-aware local token counter. Immutable: the catalog-resolved encoding
  * is fixed at construction, so a cached count can never straddle two
@@ -157,10 +169,11 @@ interface MessageEstimate {
  * when the model's encoding changes); one-shot flows construct their own for
  * the model that will be billed. Known tokenizer families use exact native
  * counts; unknown models keep the fast byte estimate (or o200k when
- * `PI_TOKENIZER_ACCURATE=1`).
+ * `PI_TOKENIZER_ACCURATE=1` or {@link TokenizerOptions.nativeFallback}).
  */
 export class Tokenizer {
 	readonly #encoding: natives.Encoding | null;
+	readonly #nativeFallback: boolean;
 
 	/** Exact counts only; byte fallbacks remain mode-dependent and uncached. */
 	readonly #nativeCounts = new LRUCache<string, number>({
@@ -179,19 +192,25 @@ export class Tokenizer {
 	 */
 	#estimates = new WeakMap<AgentMessage, MessageEstimate>();
 
-	constructor(model?: Pick<Model, "tokenizer"> | null) {
+	constructor(model?: Pick<Model, "tokenizer"> | null, options?: TokenizerOptions) {
 		this.#encoding = tokenizerEncodingForModel(model);
+		this.#nativeFallback = accurate || (options?.nativeFallback === true && !testEnv);
 	}
 
 	get encoding(): natives.Encoding | null {
 		return this.#encoding;
 	}
 
+	/** Whether non-strict counts come from the model's own catalog tokenizer rather than a proxy or heuristic. */
+	get exact(): boolean {
+		return !testEnv && this.#encoding !== null;
+	}
+
 	countTokens(text: string | string[], mode: TokenCountMode = "approximate"): number {
 		if (mode === "strict") return countTokensNat(text, this.#encoding, mode, this.#nativeCounts).tokens;
 		if (!testEnv && this.#encoding !== null)
 			return countTokensNat(text, this.#encoding, mode, this.#nativeCounts).tokens;
-		if (accurate) return countTokensNat(text, undefined, mode, this.#nativeCounts).tokens;
+		if (this.#nativeFallback) return countTokensNat(text, undefined, mode, this.#nativeCounts).tokens;
 		return sumFragments(text, mode === "upperbound" ? byteLength : byteEstimate);
 	}
 
@@ -258,6 +277,10 @@ export class Tokenizer {
 		}
 
 		switch (message.role) {
+			case "clmNote":
+				// Empty rewrite markers send no message of their own (see `clmRewriteCarry`).
+				if (isClmRewriteMarker(message)) return 0;
+				return this.countTokens(prompt.render(clmNoteContextPrompt, { content: escapeXmlText(message.content) }));
 			case "user":
 			case "developer": {
 				// Both roles carry `string | (TextContent | ImageContent)[]` and both are

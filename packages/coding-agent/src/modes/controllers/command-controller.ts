@@ -42,6 +42,7 @@ import type { InteractiveModeContext } from "../../modes/types";
 import { ContextUsageView } from "@oh-my-pi/pi-tui/status-line/context-usage";
 import { JobsPanel } from "@oh-my-pi/pi-tui/overlays/jobs-panel";
 import { computeSessionContextBreakdown } from "../../session/context-usage-runtime";
+import { runContextCommand } from "../../slash-commands/helpers/clm-context";
 import { buildHotkeysMarkdown, HotkeysSheetComponent } from "@oh-my-pi/pi-tui/hotkeys-markdown";
 import { isNativeRendering } from "@oh-my-pi/pi-tui/native/state";
 import { buildToolsMarkdown } from "@oh-my-pi/pi-tui/prompt/tools-markdown";
@@ -713,13 +714,14 @@ export class CommandController {
 		showMarkdownPanel(this.ctx, "Available Tools", tools);
 	}
 
-	handleContextCommand(): void {
+	async handleContextCommand(args = ""): Promise<void> {
+		const text = await runContextCommand(this.ctx.session, args);
+		this.ctx.presentCommandOutput([new Spacer(1), new Text(text, 1, 0)]);
+		if (args) return;
 		const breakdown = computeSessionContextBreakdown(this.ctx.session, { snapcompactSavings: true });
-		if (breakdown.contextWindow <= 0) {
-			this.ctx.showWarning("Context usage is unavailable: no model is selected for this session.");
-			return;
+		if (breakdown.contextWindow > 0) {
+			this.ctx.presentCommandOutput(new ContextUsageView(breakdown, theme));
 		}
-		this.ctx.presentCommandOutput(new ContextUsageView(breakdown, theme));
 	}
 
 	async handleMemoryCommand(text: string): Promise<void> {

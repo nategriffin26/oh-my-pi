@@ -53,6 +53,7 @@ import type {
 	AgentEvent,
 	AgentLoopConfig,
 	AgentMessage,
+	AgentRequestAdmissionHook,
 	AgentState,
 	AgentTool,
 	AgentToolContext,
@@ -487,10 +488,13 @@ export class Agent {
 	#beforeModelCall?: AgentBeforeModelCall;
 	#additionalBeforeModelCalls = new Set<AgentBeforeModelCall>();
 	#asideMessageProvider?: () => AsideMessage[] | Promise<AsideMessage[]>;
+	#requestAdmission?: AgentRequestAdmissionHook;
 	#telemetry?: AgentLoopConfig["telemetry"];
 	#appendOnlyContext?: AppendOnlyContextManager;
 	#beforeQueuedMessageDequeueHooks = new Set<(signal?: AbortSignal) => Promise<void> | void>();
-	#beforeModelCallHooks = new Set<(signal?: AbortSignal) => Promise<void> | void>();
+	#beforeModelCallHooks = new Set<
+		(signal: AbortSignal | undefined, messages: AgentMessage[]) => Promise<void> | void
+	>();
 
 	/** Buffered Cursor tool results with text length at time of call (for correct ordering) */
 	#cursorToolResultBuffer: CursorToolResultEntry[] = [];
@@ -933,15 +937,17 @@ export class Agent {
 		return () => this.#beforeQueuedMessageDequeueHooks.delete(registration);
 	}
 
-	/** Register an independently removable hook that runs immediately before each model call. */
-	addBeforeModelCallHook(hook: (signal?: AbortSignal) => Promise<void> | void): () => void {
-		const registration = (signal?: AbortSignal) => hook(signal);
+	/** Register a preconversion hook over the mutable active-loop messages (which may include queued input not yet in state). */
+	addBeforeModelCallHook(
+		hook: (signal: AbortSignal | undefined, messages: AgentMessage[]) => Promise<void> | void,
+	): () => void {
+		const registration = (signal: AbortSignal | undefined, messages: AgentMessage[]) => hook(signal, messages);
 		this.#beforeModelCallHooks.add(registration);
 		return () => this.#beforeModelCallHooks.delete(registration);
 	}
 
-	async #runBeforeModelCallHooks(signal?: AbortSignal): Promise<void> {
-		for (const hook of this.#beforeModelCallHooks) await hook(signal);
+	async #runBeforeModelCallHooks(signal: AbortSignal | undefined, messages: AgentMessage[]): Promise<void> {
+		for (const hook of this.#beforeModelCallHooks) await hook(signal, messages);
 	}
 
 	async #runBeforeQueuedMessageDequeueHooks(signal?: AbortSignal): Promise<void> {
@@ -1076,6 +1082,11 @@ export class Agent {
 		return this.#liveSteered.map(entry => entry.message);
 	}
 
+	/** Whether this agent has a custom native request-payload interceptor. */
+	get hasProviderPayloadInterceptor(): boolean {
+		return this.#onPayload !== undefined;
+	}
+
 	setProviderResponseInterceptor(fn: SimpleStreamOptions["onResponse"] | undefined): void {
 		this.#onResponse = fn;
 	}
@@ -1130,6 +1141,11 @@ export class Agent {
 	 */
 	setAsideMessageProvider(fn: (() => AsideMessage[] | Promise<AsideMessage[]>) | undefined): void {
 		this.#asideMessageProvider = fn;
+	}
+
+	/** Admit each provider request before conversion. See `AgentLoopConfig.admitRequest`. */
+	setRequestAdmission(fn: AgentRequestAdmissionHook | undefined): void {
+		this.#requestAdmission = fn;
 	}
 
 	emitExternalEvent(event: AgentEvent) {
@@ -1795,20 +1811,21 @@ export class Agent {
 			getApiKey: this.getApiKey,
 			getToolContext: this.#getToolContext,
 			syncContextBeforeModelCall: async (context, signal) => {
-				await this.#runBeforeModelCallHooks(signal);
+				await this.#runBeforeModelCallHooks(signal, context.messages);
 				if (this.#listeners.size > 0) {
 					await Bun.sleep(0);
 				}
 				context.systemPrompt = this.#state.systemPrompt;
 				context.tools = this.#toolsForModel(this.#state.model ?? model);
 			},
+			admitRequest: this.#requestAdmission,
 			beforeModelCall:
 				this.#beforeModelCall || this.#additionalBeforeModelCalls.size > 0
-					? async (context, signal) => {
-							const result = (await this.#beforeModelCall?.(context, signal)) || undefined;
+					? async (context, signal, request) => {
+							const result = (await this.#beforeModelCall?.(context, signal, request)) || undefined;
 							if (result?.stop) return result;
 							for (const callback of this.#additionalBeforeModelCalls) {
-								const callbackResult = (await callback(context, signal)) || undefined;
+								const callbackResult = (await callback(context, signal, request)) || undefined;
 								if (callbackResult?.stop) return callbackResult;
 							}
 							return undefined;

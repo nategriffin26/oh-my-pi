@@ -1229,6 +1229,8 @@ async function runLoopBody(
 		let softRequiredTool: string | undefined;
 		let softSatisfies: SoftToolRequirement["satisfies"];
 		let directiveResolvedForTurn = false;
+		// Admission's per-request output cap, kept with the turn like the directive above.
+		let requestMaxTokens: number | undefined;
 		let turnOpen = false;
 		// A trailing assistant message with unpaired tool calls: the harness
 		// stripped the failed/aborted results so this run re-executes the calls
@@ -1341,11 +1343,32 @@ async function runLoopBody(
 							softRequirementState.escalations = 0;
 						}
 						directiveResolvedForTurn = true;
+						const admission = await config.admitRequest?.(currentContext.messages, signal);
+						for (const message of admission?.messages ?? []) {
+							currentContext.messages.push(message);
+							newMessages.push(message);
+							turnMessages.push(message);
+						}
+						requestMaxTokens =
+							admission?.maxTokens === undefined
+								? config.maxTokens
+								: Math.min(admission.maxTokens, config.maxTokens ?? Number.POSITIVE_INFINITY);
 					}
 
 					preparedProviderCall = await prepareProviderCall(currentContext, config, signal);
+					preparedProviderCall.maxTokens = requestMaxTokens;
 					preparedProviderCall.liveSteering = openLiveSteering(config, signal, preparedProviderCall);
-					gateResult = (await config.beforeModelCall?.(preparedProviderCall.context, signal)) || undefined;
+					const request = {
+						model: preparedProviderCall.model,
+						messages: currentContext.messages,
+						maxTokens: requestMaxTokens,
+					};
+					gateResult =
+						(await config.beforeModelCall?.(preparedProviderCall.context, signal, request)) || undefined;
+					preparedProviderCall.maxTokens =
+						request.maxTokens === undefined
+							? requestMaxTokens
+							: Math.min(request.maxTokens, requestMaxTokens ?? Number.POSITIVE_INFINITY);
 				} catch (error) {
 					if (!turnOpen) {
 						stream.push({ type: "turn_start" });
@@ -1804,6 +1827,8 @@ interface PreparedProviderCall {
 	ownedDialect: Dialect | undefined;
 	/** Steering source offered to the provider for this call. */
 	liveSteering?: LiveSteeringChannel;
+	/** Output cap the request admission lowered for this call. */
+	maxTokens?: number;
 }
 
 /**
@@ -1945,6 +1970,7 @@ async function streamAssistantResponse(
 ): Promise<AssistantMessage> {
 	const providerCall = prepared ?? (await prepareProviderCall(context, config, signal));
 	const { model, context: llmContext, promptToolWireTools, ownedDialect } = providerCall;
+	const maxTokens = providerCall.maxTokens ?? config.maxTokens;
 
 	const streamFunction = streamFn || streamSimple;
 
@@ -2004,7 +2030,7 @@ async function streamAssistantResponse(
 		parent: invokeAgentSpan,
 		stepNumber: chatStepNumber,
 		request: {
-			maxTokens: config.maxTokens,
+			maxTokens,
 			temperature: effectiveTemperature,
 			topP: config.topP,
 			topK: config.topK,
@@ -2052,6 +2078,7 @@ async function streamAssistantResponse(
 				signal: finalRequestSignal,
 				onResponse: captureOnResponse,
 				liveSteering: providerCall.liveSteering,
+				maxTokens,
 			});
 			if (promptToolWireTools && ownedDialect) {
 				// Re-materialize in-band tool-call text as native toolCall content blocks

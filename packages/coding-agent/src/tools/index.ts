@@ -97,6 +97,7 @@ import {
 import { cfgAutolearnEnabled } from "../autolearn/settings";
 import { cfgBashEnabled } from "../exec/settings";
 import { cfgCompactionExperimentalContextManagement } from "../session/context-settings";
+import type { ClmContextAccess, ClmParentArchiveGrant } from "../session/clm-types";
 import { cfgPythonInterpreter } from "../eval/settings";
 import { cfgExternalThinking } from "../session/settings";
 import { cfgGoalEnabled } from "../goals/settings";
@@ -188,6 +189,13 @@ export type ImageAttachmentEntry = {
  * yield queue like background-job results.
  */
 export interface DeferredDiagnosticsEntry {
+	/** Host generation and full observation, before display deduplication. */
+	mutationVersion?: number;
+	snapshot?: { summary: string; messages: string[]; errored: boolean };
+	/** Legacy display deduplication; managed host snapshots still invalidate prior observations. */
+	suppressed?: boolean;
+	/** Journal-owned report ID, assigned by the SDK host. */
+	observationId?: string;
 	/** Absolute path the diagnostics belong to (the renderer shortens it). */
 	path: string;
 	/** One-line severity summary, e.g. "2 errors". */
@@ -206,6 +214,10 @@ export interface DeferredDiagnosticsEntry {
 
 /** Session context for tool factories */
 export interface ToolSession {
+	/** Session-owned experimental context document; never inherited by advisors. */
+	clmContext?: ClmContextAccess;
+	/** Read-only grant over the spawning parent's CLM archive (`context://parent/archive*`); subagents only, never advisors. */
+	parentClmArchive?: ClmParentArchiveGrant;
 	/** Current working directory */
 	cwd: string;
 	/** Additional workspace directories beyond cwd (multi-root), forwarded to subagents. */

@@ -95,6 +95,7 @@ Notes:
 - `parentSession` is an opaque lineage string. Current code writes either a session id or a session path depending on flow (`fork`, `forkFrom`, `createBranchedSession`, or explicit `newSession({ parentSession })`). Treat it as metadata, not a typed foreign key.
 
 - `titleSource` is `auto` or `user`; automatic renames cannot overwrite a user title.
+- `requiredFeatures.contextProjection = 1` marks journals containing experimental CLM snapshots; `requiredFeatures.managedDiagnostics = 1` marks host-managed diagnostic provenance, even before a snapshot is written. New readers reject unknown required features/versions. This metadata does not make pre-feature binaries reject these files: opening either journal with an old build is unsupported.
 
 ### Entry Base (`SessionEntryBase`)
 
@@ -111,6 +112,16 @@ All non-header entries include:
 
 `parentId` can be `null` for a root entry (first append, or after `resetLeaf()`). Generated entry ids are normally eight hexadecimal characters, with a full Snowflake id as the collision-exhaustion fallback; consumers must not assume a fixed width.
 
+## CLM effective context
+
+An experimental `context_projection` entry owns a complete effective-message snapshot, separate from the append-only execution transcript. Version 1 records `previousRevisionId`, `coveredThroughEntryId`, `messages`, `rewriteAt`, before/after token estimates, and cause (`edit`, `restore`, `compact`, `rebase`, or `diagnostics`). Process these checkpoints in branch order with compaction and reset boundaries, not as a final overlay over whichever compaction happens to be newest. Later ordinary messages append once after the checkpoint. Unsafe legacy compaction across a projection is rejected; CLM rescue creates a successor projection.
+
+Snapshot serialization is lossless and preserves native message fields. Nested image blobs remain reachable for loading, forks, and garbage collection; missing content or corrupt/unsupported snapshots fail closed. Accepted revisions survive resume and setting changes. Reset hides earlier context/revisions but does not erase the forensic journal or its feature requirement. Restore creates another revision, not an edit to a prior record.
+
+The host persists completed execution outcomes, then atomically stores a checkpoint before synchronously publishing both live message arrays. Diagnostic retirement before dispatch checkpoints only the session-owned prefix; queued input remains outside that checkpoint and is emitted once through the normal loop. A failed atomic write must restore the previous authoritative state; indeterminate persistence/publication stops future requests. Display/share exports are not private resumable checkpoints.
+
+Managed late diagnostics carry observation IDs backed by typed `lsp-diagnostic-state` custom entries. Replay authenticates the complete diagnostic body and removes only observations superseded by recorded mutations or reports. Multi-file notices can retain current portions; unknown, legacy, or altered notices remain protected. Mutation chronology is session-wide because history navigation does not undo filesystem changes. Path forks carry invalidations when necessary, without importing unrelated branch content. Original reports remain in the journal. See [CLM usage, limits, and recovery](./compaction.md#experimental-context-document-management-clm).
+
 ## Entry Taxonomy
 
 `SessionEntry` is the union of:
@@ -121,6 +132,7 @@ All non-header entries include:
 - `model_change`
 - `service_tier_change`
 - `compaction`
+- `context_projection`
 - `branch_summary`
 - `reset_boundary`
 - `custom`

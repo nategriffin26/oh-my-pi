@@ -32,6 +32,7 @@ import { buildOutputValidator } from "../tools/output-schema-validator";
 import { trackLateCleanup } from "../utils/late-cleanup";
 import { type DiscoveryResult, discoverAgents, getAgent } from "./discovery";
 import { type ExecutorOptions, runSubprocess } from "./executor";
+import { type ResolvedTaskHandoff, resolveTaskHandoff, type TaskHandoffRequest } from "./handoff";
 import {
 	applyEligibleNestedPatches,
 	type IsolationContext,
@@ -113,6 +114,8 @@ export interface StructuredSubagentRequest {
 	effort?: TaskEffort;
 	/** Caller's description of how open-ended the work is; steers the child's `auto` thinking classification. */
 	solutionSpace?: string;
+	/** Task-tool parent handoff fields; absent (eval, internal callers) = brief. */
+	handoff?: TaskHandoffRequest;
 	identity?: StructuredSubagentIdentity;
 	index?: number;
 	parentToolCallId?: string;
@@ -171,6 +174,8 @@ export interface EffectiveSubagentPolicy {
 	applyChanges: boolean;
 	enableLsp: boolean;
 	enableIrc: boolean;
+	/** Resolved parent handoff; `undefined` = no CLM parent (assignment and shared context only). */
+	handoff?: ResolvedTaskHandoff;
 }
 
 /** Settled child execution plus data needed by the frontends' own rendering. */
@@ -366,7 +371,26 @@ export async function resolveEffectiveSubagentPolicy(
 			"Subagent isolated execution requires task.isolation.enabled; it is currently false.",
 		);
 	}
+	const parentAccess = request.session.clmContext;
+	const ownsParentAccess =
+		parentAccess !== undefined &&
+		request.session.getSessionId?.() === parentAccess.ownerSessionId &&
+		request.session.sessionManager?.getSessionId?.() === parentAccess.ownerSessionId;
+	let handoff: ResolvedTaskHandoff | undefined;
+	try {
+		handoff = resolveTaskHandoff({
+			access: ownsParentAccess ? parentAccess : undefined,
+			// Non-task launches (eval agents, internal callers) have no handoff fields: brief, which
+			// still grants a CLM parent's read-only archive.
+			request: request.invocationKind === "task" ? request.handoff : { mode: "brief" },
+			agent,
+			parentSessionFile: request.session.getSessionFile(),
+		});
+	} catch (error) {
+		throw new StructuredSubagentError("preflight", error instanceof Error ? error.message : String(error));
+	}
 	return {
+		handoff,
 		discovery,
 		agentName,
 		agent,
@@ -494,6 +518,10 @@ function buildExecutorOptions(
 		task: renderSubagentPrompt(request.assignment),
 		assignment: request.assignment.trim(),
 		context: request.context?.trim() || undefined,
+		...(policy.handoff?.mode === "fork" ? { forkParentSession: true } : {}),
+		...(policy.handoff?.seed ? { handoffSeed: policy.handoff.seed } : {}),
+		...(policy.handoff?.manifest ? { handoffManifest: policy.handoff.manifest } : {}),
+		...(policy.handoff?.grant ? { parentClmArchive: policy.handoff.grant } : {}),
 		planReference: undefined,
 		// Task `name` is the spawn handle (id allocation). Eval `label` is a
 		// real UI description. Copy it only for eval so generateTaskLabel can run.
@@ -746,6 +774,11 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 			}
 		}
 		let result: SingleResult;
+		// A fork copies the parent's journal from disk; it must hold this turn's tool call.
+		if (policy.handoff?.mode === "fork") {
+			await request.session.sessionManager?.ensureOnDisk();
+			await request.session.sessionManager?.flush();
+		}
 		if (!isolationContext) {
 			result = await runSubprocess(baseOptions);
 			onSubprocessResult?.(result);

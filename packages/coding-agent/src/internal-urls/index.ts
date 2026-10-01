@@ -14,6 +14,7 @@ export * from "./attachment-protocol";
 export * from "./cfg-protocol";
 export * from "./conflict-protocol";
 export * from "./context";
+export * from "./context-protocol";
 export * from "./history-protocol";
 export * from "./issue-pr-protocol";
 export * from "./local-protocol";

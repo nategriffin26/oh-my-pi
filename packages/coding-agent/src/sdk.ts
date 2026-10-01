@@ -129,6 +129,7 @@ import {
 } from "./extensibility/skills";
 import { type FileSlashCommand, loadSlashCommands as loadSlashCommandsInternal } from "./extensibility/slash-commands";
 import type { HindsightSessionState } from "./hindsight/state";
+import type { ClmParentArchiveGrant } from "./session/clm-types";
 import { LocalProtocolHandler, type LocalProtocolOptions } from "./internal-urls";
 import { stripXdUrlPrefix } from "@oh-my-pi/pi-tui/tools/xd-url";
 import { setSharedLspEnabled } from "./lsp/client";
@@ -150,7 +151,7 @@ import { createSessionMemoryRuntimeContext, resolveMemoryBackend } from "./memor
 import { MEMORY_BACKEND_TOOL_NAMES } from "./memory-backend/tool-names";
 import type { MnemopiSessionState } from "./mnemopi/state";
 import mcpXdevGuidanceTemplate from "./prompts/system/mcp-xdev-guidance.md" with { type: "text" };
-import lateDiagnosticTemplate from "./prompts/tools/lsp-late-diagnostic.md" with { type: "text" };
+import { buildLateDiagnosticsBatchMessage, DiagnosticLifecycle } from "./lsp/diagnostic-state";
 import { AgentLifecycleManager } from "./registry/agent-lifecycle";
 import { type AgentKind, type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "./registry/agent-registry";
 import {
@@ -303,7 +304,7 @@ import {
 	cfgToolsXdevInlineDevices,
 	cfgSessionToolGates,
 } from "./tools/settings";
-import { cfgToolsFormat } from "./session/context-settings";
+import { cfgCompaction, cfgToolsFormat } from "./session/context-settings";
 import { cfgAutolearnEnabled } from "./autolearn/settings";
 import { cfgBrowserEnabled } from "./tools/browser/settings";
 import {
@@ -387,42 +388,6 @@ type McpNotificationEntry = {
 	serverName: string;
 	uri: string;
 };
-
-type LateDiagnosticsDetails = {
-	files: Array<{ path: string; summary: string; errored: boolean; messages: string[] }>;
-};
-
-function buildLateDiagnosticsBatchMessage(
-	entries: DeferredDiagnosticsEntry[],
-): CustomMessage<LateDiagnosticsDetails> | null {
-	if (entries.length === 0) return null;
-	const files = entries.map(entry => ({
-		path: entry.path,
-		summary: entry.summary,
-		messages: entry.messages,
-		errored: entry.errored,
-	}));
-	const details: LateDiagnosticsDetails = {
-		files: files.map(file => ({
-			path: file.path,
-			summary: file.summary,
-			errored: file.errored,
-			messages: file.messages,
-		})),
-	};
-	return {
-		role: "custom",
-		customType: LSP_LATE_DIAGNOSTIC_MESSAGE_TYPE,
-		content: prompt.render(lateDiagnosticTemplate, {
-			multiple: files.length > 1,
-			files,
-		}),
-		display: true,
-		attribution: "agent",
-		details,
-		timestamp: Date.now(),
-	};
-}
 
 function buildMcpNotificationBatchMessage(entries: McpNotificationEntry[]): AgentMessage | null {
 	const resources: McpNotificationEntry[] = [];
@@ -747,6 +712,8 @@ export interface CreateAgentSessionOptions {
 	parentHindsightSessionState?: HindsightSessionState;
 	/** Parent Mnemopi state to alias for subagent memory tools. */
 	parentMnemopiSessionState?: MnemopiSessionState;
+	/** Read-only `context://parent/archive*` grant over the spawning parent's CLM archive. */
+	parentClmArchive?: ClmParentArchiveGrant;
 	/** Pre-allocated agent identity for IRC routing. Default: "Main" for top-level, parentTaskPrefix-derived for sub. */
 	agentId?: string;
 	/** Display name for the agent in IRC. Default: "main" or "sub". */
@@ -2133,10 +2100,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			if (model) return formatModelString(model);
 			return undefined;
 		};
-		// Per-path mutation counter shared across edit/write tools. Late-diagnostics
-		// entries capture it at fetch time and are dropped at injection if a newer
-		// mutation (any tool) bumped it in the meantime.
-		const fileMutationVersions = new Map<string, number>();
+		// Journal-owned observations survive resume/fork and retire only at CLM boundaries.
+		const diagnosticLifecycle = new DiagnosticLifecycle(
+			sessionManager,
+			() => (session?.getClmContext().isEnabled() ?? false) || !!sessionManager.getLatestContextProjection(),
+		);
 		const disposeCallbacks = new Set<() => void>();
 		const activeToolNames = new Set<string>();
 		const toolRegistry = new Map<string, Tool & Pick<ToolDefinition, "defaultInactive">>();
@@ -2146,6 +2114,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				activeToolNames.add(name);
 			}
 		};
+		// A grant belongs to this spawned conversation, not later sessions hosted by the same runtime.
+		const parentArchiveRecipientId = isSubagentSession ? sessionManager.getSessionId() : undefined;
 		const toolSession: ToolSession = {
 			get cwd() {
 				return sessionManager.getCwd();
@@ -2156,6 +2126,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			hasUI: options.hasUI ?? false,
 			canPromptUser: options.interactivePrompts ?? options.hasUI ?? false,
 			settingsApproval: options.settingsApproval === true && !isSubagentSession,
+			get clmContext() {
+				return session?.getClmContext();
+			},
+			get parentClmArchive() {
+				return parentArchiveRecipientId === sessionManager.getSessionId() ? options.parentClmArchive : undefined;
+			},
 			// Explicit resolvers retain their existing pass-through contract. Ordinary
 			// sessions inherit stored affinity into the child's own provider session.
 			getApiKey: options.getApiKey,
@@ -2245,7 +2221,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			getClientBridge: () => session?.clientBridge,
 			emitBeforeSubagentSpawn: (event, signal) =>
 				session?.extensionRunner?.emitBeforeSubagentSpawn(event, signal) ?? Promise.resolve(undefined),
-			queueDeferredDiagnostics: entry => session?.yieldQueue.enqueue(LSP_LATE_DIAGNOSTIC_MESSAGE_TYPE, entry),
+			queueDeferredDiagnostics: entry => {
+				const report = diagnosticLifecycle.report(entry);
+				if (report) session?.yieldQueue.enqueue(LSP_LATE_DIAGNOSTIC_MESSAGE_TYPE, report);
+			},
 			queueLaunchCompletion: notification =>
 				session?.queueLaunchCompletion(notification) ??
 				Promise.reject(new Error("Session unavailable for launch completion delivery")),
@@ -2254,12 +2233,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				return () => disposeCallbacks.delete(callback);
 			},
 			registerSessionChangeCallback: callback => session?.registerSessionChangeCallback(callback),
-			bumpFileMutationVersion: path => {
-				const next = (fileMutationVersions.get(path) ?? 0) + 1;
-				fileMutationVersions.set(path, next);
-				return next;
-			},
-			getFileMutationVersion: path => fileMutationVersions.get(path) ?? 0,
+			bumpFileMutationVersion: path => diagnosticLifecycle.mutate(path),
+			getFileMutationVersion: path => diagnosticLifecycle.version(path),
 			getTodoPhases: () => session.getTodoPhases(),
 			setTodoPhases: phases => session.setTodoPhases(phases),
 			persistTodoPhases: phases => sessionManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, { phases }),
@@ -3848,6 +3823,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				memoryBackend: memoryBackend?.id,
 				securityEnabled: cfgSecurityEnabled.get(settings),
 				settingsApproval: toolSession.settingsApproval === true,
+				clmEnabled: cfgCompaction.get(settings).experimentalClm === true,
 				evalPreludes: toolSession.getAdvertisedEvalPreludes?.(),
 				model: getActiveModelString(),
 				includeModelInPrompt: cfgIncludeModelInPrompt.get(settings),
@@ -4266,6 +4242,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				const fallbackCreditRedemption = session?.consumeActiveFallbackCreditRedemption(streamModel);
 				const merged: SimpleStreamOptions = {
 					...streamOptions,
+					liveSteering: cfgCompaction.get(settings).experimentalClm ? undefined : streamOptions?.liveSteering,
 					forceReasoningOff: externalThinking || streamOptions?.forceReasoningOff,
 					...(codeModeState.namespacesInfo === undefined
 						? {}
@@ -4361,6 +4338,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// (defaulting to read/grep/glob).
 		const advisorToolSession: ToolSession = {
 			...toolSession,
+			clmContext: undefined,
+			parentClmArchive: undefined,
 			// The primary may carry a dormant xd:// write transport. Advisors use
 			// their own configured tool slate, so a selected write is always full.
 			deviceOnlyWrite: undefined,
@@ -4496,6 +4475,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			transformContext,
 			transformProviderContext,
 			onPayload,
+			providerPayloadIsUnmodified: () => !extensionRunner.hasHandlers("before_provider_request"),
 			onResponse,
 			sideStreamFn: settingsAwareStreamFn,
 			advisorStreamFn: settingsAwareStreamFn,

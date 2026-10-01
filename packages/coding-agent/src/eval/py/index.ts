@@ -55,6 +55,7 @@ export default {
 			filename: opts.filename,
 			idleTimeoutMs: opts.idleTimeoutMs,
 			signal: opts.signal,
+			toolContext: opts.toolContext,
 			sessionId: identity.sessionId,
 			kernelMode,
 			interpreter: identity.interpreter,

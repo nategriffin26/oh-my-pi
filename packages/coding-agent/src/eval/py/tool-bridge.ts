@@ -7,6 +7,7 @@
  * current execution and forwards to the same `callSessionTool` implementation
  * the JavaScript bridge uses.
  */
+import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { logger, postmortem } from "@oh-my-pi/pi-utils";
 import type { ToolSession } from "../../tools";
 import type { RuntimeCallIdentity } from "../js/shared/runtime";
@@ -15,6 +16,7 @@ import type { EvalShadowCellSession } from "../speculation/cell-session";
 
 export interface PyToolBridgeEntry {
 	toolSession: ToolSession;
+	toolContext?: AgentToolContext;
 	/**
 	 * Turn-cancel handed to the tool implementation. Raw and never deferred, so
 	 * delegated work — above all the subagents `agent()` spawns — stops at once.
@@ -124,6 +126,7 @@ async function callSessionToolPromptOnAbort(
 	}
 	const call = callSessionTool(name, args, {
 		session: entry.toolSession,
+		toolContext: entry.toolContext,
 		signal: entry.signal,
 		emitStatus: entry.emitStatus,
 		defaultIntent: "py prelude",

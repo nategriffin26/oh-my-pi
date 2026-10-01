@@ -53,6 +53,7 @@ import type { MCPManager } from "../mcp/manager";
 import type { MnemopiSessionState } from "../mnemopi/state";
 import { initializeExtensions } from "../modes/runtime-init";
 import subagentAsyncPendingTemplate from "../prompts/system/subagent-async-pending.md" with { type: "text" };
+import subagentForkSwitchPrompt from "../prompts/system/subagent-fork-switch.md" with { type: "text" };
 import subagentSystemPromptTemplate from "../prompts/system/subagent-system-prompt.md" with { type: "text" };
 import submitReminderTemplate from "../prompts/system/subagent-yield-reminder.md" with { type: "text" };
 import { AgentLifecycleManager, type AgentReviver } from "../registry/agent-lifecycle";
@@ -69,6 +70,8 @@ import {
 import { type ArtifactManager, writeArtifact } from "../session/artifacts";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "../session/async-job-delivery";
 import type { AuthStorage } from "../session/auth-storage";
+import { CLM_HANDOFF_MESSAGE_TYPE, CLM_PARENT_MANIFEST_MESSAGE_TYPE } from "../session/clm-state";
+import type { ClmParentArchiveGrant } from "../session/clm-types";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "../session/messages";
 import { hasConversationalHistory, SessionManager } from "../session/session-manager";
 import { truncateTail } from "@oh-my-pi/pi-tui/tools/streaming-output";
@@ -86,6 +89,7 @@ import { DEFAULT_PEER_ROSTER_LIMIT } from "@oh-my-pi/pi-tui/tools/irc";
 import { normalizeSchema } from "../tools/jtd-to-json-schema";
 import { buildOutputValidator, summarizeValidationFailure } from "../tools/output-schema-validator";
 import { ToolAbortError } from "../tools/tool-errors";
+import { USER_TODO_EDIT_CUSTOM_TYPE } from "../tools/todo";
 import { resetYieldTurnState } from "../tools/yield";
 import { type EventBus, emitSubagentFrame } from "../utils/event-bus";
 import { trackLateCleanup } from "../utils/late-cleanup";
@@ -144,6 +148,8 @@ export type { YieldItem } from "@oh-my-pi/pi-tui/tools/task";
 
 const MCP_CALL_TIMEOUT_MS = 60_000;
 const TASK_ABORT_CLEANUP_GRACE_MS = 10_000;
+/** Custom type of the host notice that tells a forked child the inherited transcript is its parent's. */
+const SUBAGENT_FORK_MESSAGE_TYPE = "subagent-fork";
 
 /**
  * Soft per-agent request budgets (assistant requests per run). Crossing the
@@ -427,6 +433,14 @@ export interface ExecutorOptions {
 	assignment?: string;
 	/** Shared background from the task call (`task.batch`), rendered into the subagent's system prompt. */
 	context?: string;
+	/** Verbatim parent handoff seed, delivered as an editable `clm-handoff` message before the assignment. */
+	handoffSeed?: string;
+	/** Manifest lines of the parent's other archive items, rendered into the subagent system prompt. */
+	handoffManifest?: string;
+	/** Read-only `context://parent/archive*` grant over the spawning parent's archive. */
+	parentClmArchive?: ClmParentArchiveGrant;
+	/** Start the child from a fork of the parent's transcript (`sessionFile`) instead of an empty session. */
+	forkParentSession?: boolean;
 	/**
 	 * The session's active overall plan, handed off so subagents spawned during
 	 * plan execution share the same plan context as the main agent. Omitted when
@@ -3876,11 +3890,22 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			resolvedAt = performance.now();
 			const effectiveCwd = worktree ?? cwd;
 			const sessionManagerPromise = sessionFile
-				? SessionManager.open(sessionFile, undefined, undefined, {
-						initialCwd: effectiveCwd,
-						parentSession: options.sessionFile ?? undefined,
-						suppressBreadcrumb: true,
-					})
+				? options.forkParentSession && options.sessionFile
+					? // Fork: the child starts from the parent's transcript (tan-style), cost reset, ending at
+						// the last completed exchange: the parent's in-flight turn holding this task call is
+						// dropped so the child never mistakes the parent's delegation for its own.
+						SessionManager.forkFrom(options.sessionFile, effectiveCwd, path.dirname(sessionFile), undefined, {
+							copyArtifacts: false,
+							suppressBreadcrumb: true,
+							sessionFile,
+							resetInheritedCost: true,
+							excludeInFlightTurn: true,
+						})
+					: SessionManager.open(sessionFile, undefined, undefined, {
+							initialCwd: effectiveCwd,
+							parentSession: options.sessionFile ?? undefined,
+							suppressBreadcrumb: true,
+						})
 				: Promise.resolve(SessionManager.inMemory(effectiveCwd));
 			// Setup below can fail before this promise's consumption boundary.
 			// Observe rejection immediately while preserving it for the later await.
@@ -4022,6 +4047,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					const subagentPrompt = prompt.render(subagentSystemPromptTemplate, {
 						agent: agent.systemPrompt,
 						context: options.context?.trim() ?? "",
+						handoffManifest: options.handoffManifest ? "available" : "",
+						parentArchive: options.parentClmArchive ? "available" : "",
 						planReference: options.planReference?.content ?? "",
 						planReferencePath: options.planReference?.path ?? "",
 						worktree: worktree ?? "",
@@ -4057,6 +4084,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				subagentEventBus: options.subagentEventBus,
 				parentHindsightSessionState: options.parentHindsightSessionState,
 				parentMnemopiSessionState: options.parentMnemopiSessionState,
+				parentClmArchive: options.parentClmArchive,
 				parentTaskPrefix: id,
 				parentAgentId: options.parentAgentId,
 				agentId: id,
@@ -4296,6 +4324,28 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						{ triggerTurn: false },
 					);
 				}
+			}
+			if (options.forkParentSession) {
+				// The fork inherits the parent's todo list; its reminders would drag the child onto the parent's task.
+				session.setTodoPhases([]);
+				sessionManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, { phases: [] });
+				await session.sendCustomMessage(
+					{ customType: SUBAGENT_FORK_MESSAGE_TYPE, content: subagentForkSwitchPrompt, display: false },
+					{ triggerTurn: false },
+				);
+			}
+			if (options.handoffManifest) {
+				await session.sendCustomMessage(
+					{ customType: CLM_PARENT_MANIFEST_MESSAGE_TYPE, content: options.handoffManifest, display: false },
+					{ triggerTurn: false },
+				);
+			}
+			// Parent handoff seed: verbatim parent items, editable so the child's CLM can drop it once absorbed.
+			if (options.handoffSeed) {
+				await session.sendCustomMessage(
+					{ customType: CLM_HANDOFF_MESSAGE_TYPE, content: options.handoffSeed, display: false },
+					{ triggerTurn: false },
+				);
 			}
 
 			readyAt = performance.now();

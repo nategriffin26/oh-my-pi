@@ -55,7 +55,8 @@ function isUsageWindowBoundary(entry: SessionEntry): boolean {
 		entry.type === "custom_message" ||
 		entry.type === "branch_summary" ||
 		entry.type === "compaction" ||
-		entry.type === "reset_boundary"
+		entry.type === "reset_boundary" ||
+		entry.type === "context_projection"
 	);
 }
 
@@ -63,7 +64,11 @@ function isUsageWindowBoundary(entry: SessionEntry): boolean {
 function activeModelUsageEntries(branch: SessionEntry[]): ModelUsageEntry[] {
 	const latestCompaction = getLatestCompactionEntry(branch);
 	const compactionIndex = latestCompaction ? branch.lastIndexOf(latestCompaction) : -1;
-	const resetIndex = branch.reduce((latest, entry, index) => (entry.type === "reset_boundary" ? index : latest), -1);
+	const resetIndex = branch.reduce(
+		(latest, entry, index) =>
+			entry.type === "reset_boundary" || entry.type === "context_projection" ? index : latest,
+		-1,
+	);
 	let startIndex = 0;
 	if (resetIndex > compactionIndex) {
 		startIndex = resetIndex + 1;
@@ -225,7 +230,10 @@ export class SessionStatsTracker {
 		);
 		const branchEntries = this.#host.sessionManager.getBranch();
 		const latestCompaction = getLatestCompactionEntry(branchEntries);
-		const compactionIndex = latestCompaction ? branchEntries.lastIndexOf(latestCompaction) : -1;
+		const compactionIndex = Math.max(
+			latestCompaction ? branchEntries.lastIndexOf(latestCompaction) : -1,
+			branchEntries.findLastIndex(entry => entry.type === "context_projection" || entry.type === "reset_boundary"),
+		);
 		let usedTokens = 0;
 		let anchored = false;
 		const pendingMessages = options?.pendingMessages ?? [];
@@ -360,7 +368,10 @@ export class SessionStatsTracker {
 
 		const branchEntries = this.#host.sessionManager.getBranch();
 		const latestCompaction = getLatestCompactionEntry(branchEntries);
-		const compactionIndex = latestCompaction ? branchEntries.lastIndexOf(latestCompaction) : -1;
+		const compactionIndex = Math.max(
+			latestCompaction ? branchEntries.lastIndexOf(latestCompaction) : -1,
+			branchEntries.findLastIndex(entry => entry.type === "context_projection" || entry.type === "reset_boundary"),
+		);
 		for (let index = branchEntries.length - 1; index > compactionIndex; index--) {
 			const entry = branchEntries[index];
 			if (entry.type !== "message" || !isTranscriptUsageAnchor(entry.message)) continue;

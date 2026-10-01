@@ -2421,6 +2421,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 
 					if (capturedDisplayContent) {
 						details.displayContent = capturedDisplayContent;
+						details.raw = rawSelector;
 					}
 
 					// Immutable sources have no edit path, so their markers are content, not conflicts.
@@ -2551,7 +2552,12 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		signal?: AbortSignal,
 	): Promise<AgentToolResult<ReadToolDetails>> {
 		if (parsedSel.kind === "image") throw new ToolError("The ':img' selector requires a file-backed path.");
-		const resource = await InternalUrlRouter.instance().resolve(url, sessionResolveContext(this.session, { signal }));
+		const continuesLines =
+			parsedSel.kind === "tail" || (parsedSel.kind === "lines" && parsedSel.ranges[0].startLine > 1);
+		const resource = await InternalUrlRouter.instance().resolve(
+			url,
+			sessionResolveContext(this.session, { signal, continuesLines }),
+		);
 		if (question !== undefined) throw new ToolError(IMAGE_QUESTION_SELECTOR_ERROR);
 		const resourceDetails: NonNullable<InternalResource["details"]> = resource.details ?? {};
 		const { display, ...render } = resourceDetails;

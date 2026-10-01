@@ -261,6 +261,8 @@ export interface AgentSessionConfig {
 	codexResetCoordinator?: CodexAutoRedeemCoordinator;
 	/** Provider payload hook used by the active session request path. */
 	onPayload?: SimpleStreamOptions["onPayload"];
+	/** Host certification for an observation-only payload wrapper; evaluated per request as extension handlers change. */
+	providerPayloadIsUnmodified?: () => boolean;
 	/** Provider response hook used by the active session request path. */
 	onResponse?: SimpleStreamOptions["onResponse"];
 	/** Raw SSE hook used by the active session request path. */

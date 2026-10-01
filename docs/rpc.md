@@ -235,6 +235,16 @@ correlate it via `id`. Ordering across concurrent commands is not guaranteed
 
 The bundled TypeScript `RpcClient.getMessages()` and Python `RpcClient.get_messages()` drain this paged endpoint automatically after negotiating v2. They retain the legacy monolithic command when connected to a v1 server, and on either `session_busy` or `stale_cursor` they discard partial pages and fall back to the legacy best-effort snapshot. Direct `getMessagesPage()` and `get_messages_page()` calls remain strict so incremental hosts never mix snapshots silently.
 
+### Experimental context revisions
+
+- `{ id?, type: "get_clm_context", target: { kind: "status" | "document" | "history" } }`
+- `{ id?, type: "get_clm_context", target: { kind: "revision" | "diff", revision: string } }`
+- `{ id?, type: "restore_clm_context", revision: string }`
+
+Successful responses return `data: { text: string }`. Reads remain available with the edit setting disabled. Restore requires CLM enabled, an idle session, and a revision visible on the active branch (`"previous"` selects the preceding checkpoint). It appends a new durable revision while retaining current protected constraints; it never mutates the original transcript. The equivalent slash commands are `/context status|show|history|diff <revision>|restore <revision>`. See [CLM semantics and downgrade restrictions](./compaction.md#experimental-context-document-management-clm).
+
+For `target: { kind: "status" }`, parse `data.text` as JSON. Its budget fields include `estimatedRequestTokens` (the fit estimate), `localRequestTokens`, nullable `calibratedRequestTokens`, and `usageAnchor` with `valid`, `reason`, `promptTokens`, `provider`, `model`, and `timestamp`. A valid anchor measures a prior unchanged request prefix, not the whole next request; appended input remains estimated. `lastObservedUsage` is historical only. Calibration is not restored from retained assistant usage on resume and is invalidated by context rewrites or incompatible request framing. See the linked CLM budget rules for invalidation and payload-hook limits.
+
 ### Login
 
 - `{ id?, type: "get_login_providers" }`

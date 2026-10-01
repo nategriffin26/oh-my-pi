@@ -41,6 +41,7 @@ export default {
 			cwd: opts.cwd,
 			idleTimeoutMs: opts.idleTimeoutMs,
 			signal: opts.signal,
+			toolContext: opts.toolContext,
 			sessionId: identity.sessionKey,
 			kernelOwnerId: identity.ownerId,
 			sessionFile: opts.sessionFile,

@@ -3,10 +3,15 @@ import { ConcatSink, getBlobsDir, isEnoent, isEnotdir, parseJsonlLenient } from 
 import * as snapcompact from "@oh-my-pi/snapcompact";
 import { Semaphore } from "../task/parallel";
 import { BlobStore, isBlobRef, lazyImageDataSync, resolveImageData, resolveImageDataUrl } from "./blob-store";
+import { freezeSnapshot, validateContextProjection, validateSessionRequirements } from "./clm-state";
 import { buildSessionContext } from "./session-context";
 import type { FileEntry, RawFileEntry, SessionEntry, SessionHeader } from "./session-entries";
 import { migrateToCurrentVersion } from "./session-migrations";
-import { isExternalizableImagePosition, isPersistenceTruncatedString } from "./session-persistence";
+import {
+	hydrateProjectionStrings,
+	isExternalizableImagePosition,
+	isPersistenceTruncatedString,
+} from "./session-persistence";
 import { FileSessionStorage, type SessionStorage } from "./session-storage";
 import {
 	parseTitleSlotFromContent,
@@ -86,6 +91,25 @@ function applyTitleSlot(entry: FileEntry | undefined, slot: SessionTitleUpdate |
 	}
 }
 
+/** JSON escapes quotes inside strings, so this token marks only real projection objects, never quoted text. */
+const PROJECTION_TYPE_TOKEN = '"type":"context_projection"';
+
+/** A skipped record may be a projection whenever the journal declares or holds one; never resume raw history then. */
+function assertNoSkippedProjection(entries: readonly FileEntry[], malformedRecords: number): void {
+	if (
+		malformedRecords > 0 &&
+		entries.some(
+			entry =>
+				typeof entry === "object" &&
+				entry !== null &&
+				(entry.type === "context_projection" ||
+					(entry.type === "session" && entry.requiredFeatures?.contextProjection !== undefined)),
+		)
+	) {
+		throw new Error("Malformed journal containing CLM context projection; refusing history fallback");
+	}
+}
+
 /** Parse session JSONL while stripping and folding the optional fixed title slot. */
 export function parseSessionContent(content: string): SessionLoadResult {
 	const { body, slot } = splitTitleSlot(content);
@@ -95,6 +119,16 @@ export function parseSessionContent(content: string): SessionLoadResult {
 			malformedRecords++;
 		},
 	}) as FileEntry[];
+	if (malformedRecords > 0 && body.includes(PROJECTION_TYPE_TOKEN)) {
+		throw new Error("Malformed journal containing CLM context projection; refusing history fallback");
+	}
+	assertNoSkippedProjection(entries, malformedRecords);
+	for (const entry of entries) {
+		// Lenient JSONL keeps bare values (e.g. `null`); only objects can carry CLM state.
+		if (typeof entry !== "object" || entry === null) continue;
+		if (entry.type === "context_projection") validateContextProjection(entry);
+		if (entry.type === "session") validateSessionRequirements(entry);
+	}
 	applyTitleSlot(entries[0], slot);
 	return {
 		entries,
@@ -177,6 +211,11 @@ export async function visitEntriesFromFileStream(
 					applyTitleSlot(entry, titleSlot);
 				}
 				try {
+					// A bare JSON value (e.g. a `null` line) is the visitor's to tolerate; only objects can carry CLM state.
+					if (typeof value === "object" && value !== null) {
+						if (entry.type === "context_projection") validateContextProjection(entry);
+						if (entry.type === "session") validateSessionRequirements(entry);
+					}
 					if (visit(entry) === false) {
 						stopped = true;
 						break;
@@ -198,6 +237,9 @@ export async function visitEntriesFromFileStream(
 				// Malformed record: skip past the next newline and continue.
 				const nextNewline = buffer.indexOf(0x0a, read);
 				if (nextNewline === -1) break; // rest of the bad line not yet received
+				if (decoder.decode(buffer.subarray(read, nextNewline)).includes(PROJECTION_TYPE_TOKEN)) {
+					throw new Error("Malformed CLM context projection record");
+				}
 				let nonWhitespace = false;
 				for (let index = read; index < nextNewline; index++) {
 					const byte = buffer[index];
@@ -314,6 +356,7 @@ export async function loadEntriesFromFileStream(
 			},
 		},
 	);
+	assertNoSkippedProjection(entries, malformedRecords);
 	return {
 		entries,
 		titleSlot,
@@ -509,15 +552,37 @@ async function resolveBlobRefs(values: readonly unknown[], blobStore: BlobStore)
 	const pending: Promise<void>[] = [];
 	for (const value of values) {
 		if (!containsBlobRef(value)) continue;
-		pending.push(resolvePersistedBlobRefs(value, resolve));
+		const strict =
+			typeof value === "object" && value !== null && "type" in value && value.type === "context_projection";
+		pending.push(
+			resolvePersistedBlobRefs(
+				value,
+				strict
+					? async (data, asDataUrl) => {
+							const resolved = await resolve(data, asDataUrl);
+							if (isBlobRef(resolved)) throw new Error("Missing image blob required by CLM context projection");
+							return resolved;
+						}
+					: resolve,
+			),
+		);
 	}
 	await Promise.all(pending);
 }
 
 export async function resolveBlobRefsInEntries(entries: FileEntry[], blobStore: BlobStore): Promise<void> {
 	const sessionEntries = entries.filter(entry => entry.type !== "session");
-	for (const entry of sessionEntries) repairTruncatedSnapcompactFrames(entry);
+	for (const entry of sessionEntries) {
+		await hydrateProjectionStrings(entry, blobStore);
+		repairTruncatedSnapcompactFrames(entry);
+	}
 	await resolveBlobRefs(sessionEntries, blobStore);
+	for (const entry of sessionEntries) {
+		if (entry.type === "context_projection") {
+			validateContextProjection(entry);
+			freezeSnapshot(entry);
+		}
+	}
 }
 
 /**
@@ -532,8 +597,11 @@ export async function loadSessionMessagesReadOnly(filePath: string): Promise<Age
 	const entries = await loadEntriesFromFile(filePath);
 	if (entries.length === 0) return [];
 	migrateToCurrentVersion(entries);
-	for (const entry of entries) repairTruncatedSnapcompactFrames(entry);
 	const blobs = new BlobStore(getBlobsDir());
+	for (const entry of entries) {
+		await hydrateProjectionStrings(entry, blobs);
+		repairTruncatedSnapcompactFrames(entry);
+	}
 	const sessionEntries = entries.filter((e): e is SessionEntry => e.type !== "session");
 	const { messages } = buildSessionContext(sessionEntries, undefined, undefined, {
 		transcript: true,

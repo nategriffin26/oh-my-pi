@@ -185,6 +185,8 @@ export interface SessionData {
 	systemPrompt?: string;
 	tools?: { name: string; description: string }[];
 	subSessions?: Record<string, SubSession>;
+	/** Human transcript export; not a resumable session journal. */
+	displayOnly?: true;
 }
 
 function sessionHeaderForExport(header: SessionHeader | null): SessionHeader | null {
@@ -194,14 +196,31 @@ function sessionHeaderForExport(header: SessionHeader | null): SessionHeader | n
 	return exported;
 }
 
+/** Keep branch/audit identity, but omit private resumable snapshot bodies. */
+export function displayEntriesForExport(entries: readonly SessionEntry[]): SessionEntry[] {
+	return entries.map(entry =>
+		entry.type === "context_projection"
+			? {
+					type: "custom",
+					id: entry.id,
+					parentId: entry.parentId,
+					timestamp: entry.timestamp,
+					customType: "clm_context_projection",
+					data: { revision: entry.id, cause: entry.cause, snapshotOmitted: true, displayOnly: true },
+				}
+			: entry,
+	);
+}
+
 /** Snapshot the session (plus optional agent state) into the JSON shape the viewer renders. */
 export function buildSessionData(sm: SessionManager, state?: AgentState): SessionData {
 	return {
 		header: sessionHeaderForExport(sm.getHeader()),
-		entries: sm.getEntries(),
+		entries: displayEntriesForExport(sm.getEntries()),
 		leafId: sm.getLeafId(),
 		systemPrompt: state?.systemPrompt.join("\n\n"),
 		tools: state?.tools?.map(t => ({ name: t.name, description: t.description })),
+		displayOnly: true,
 	};
 }
 
@@ -245,7 +264,7 @@ async function collectSubSessionsFromDir(
 				agentId,
 				parent: parentKey,
 				header: sessionHeaderForExport(header),
-				entries,
+				entries: displayEntriesForExport(entries),
 				leafId: entries.length > 0 ? entries[entries.length - 1].id : null,
 			};
 		}
@@ -312,8 +331,9 @@ export async function exportFromFile(inputPath: string, options?: ExportOptions 
 
 	const sessionData: SessionData = {
 		header: sessionHeaderForExport(sm.getHeader()),
-		entries: sm.getEntries(),
+		entries: displayEntriesForExport(sm.getEntries()),
 		leafId: sm.getLeafId(),
+		displayOnly: true,
 	};
 	if (opts.includeSubSessions !== false) {
 		const subSessions = await collectSubSessions(inputPath);

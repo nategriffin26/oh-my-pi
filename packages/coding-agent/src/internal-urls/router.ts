@@ -22,6 +22,7 @@ import { ArtifactProtocolHandler } from "./artifact-protocol";
 import { AttachmentProtocolHandler } from "./attachment-protocol";
 import { CfgProtocolHandler } from "./cfg-protocol";
 import { ConflictProtocolHandler } from "./conflict-protocol";
+import { ContextProtocolHandler } from "./context-protocol";
 import { HistoryProtocolHandler } from "./history-protocol";
 import { IssueProtocolHandler, PrProtocolHandler } from "./issue-pr-protocol";
 import { LocalProtocolHandler } from "./local-protocol";
@@ -100,6 +101,7 @@ export class InternalUrlRouter {
 		this.register(new MemoryProtocolHandler());
 		this.register(new AgentProtocolHandler());
 		this.register(new HistoryProtocolHandler());
+		this.register(new ContextProtocolHandler());
 		this.register(new ArtifactProtocolHandler());
 		this.register(new LocalProtocolHandler());
 		this.register(new ProcProtocolHandler());
@@ -132,8 +134,7 @@ export class InternalUrlRouter {
 	/**
 	 * Install (or replace) the handler for `handler.scheme`. Throws when the spec's write
 	 * policy disagrees with the handler: `write()` exists exactly for `write.via: "handler"`;
-	 * `write.via: "file"` needs a mutable file-backed spec with `locate()`; a `sandbox` scope
-	 * needs a linkable `locateSync()` so {@link sandboxRoots} can locate its root.
+	 * file-backed sandbox needs a linkable `locateSync()` so {@link sandboxRoots} can locate its root.
 	 */
 	register(handler: ProtocolHandler): void {
 		const { scheme, spec } = handler;
@@ -153,7 +154,7 @@ export class InternalUrlRouter {
 			if (!handler.locate) throw new Error(`${scheme}:// spec.write.via "file" requires a locate() hook`);
 			if (spec.immutable) throw new Error(`${scheme}:// spec.write.via "file" contradicts spec.immutable`);
 		}
-		if (spec.write?.scope === "sandbox" && (!spec.linkable || !handler.locateSync)) {
+		if (spec.write?.scope === "sandbox" && via === "file" && (!spec.linkable || !handler.locateSync)) {
 			throw new Error(`${scheme}:// spec.write.scope "sandbox" requires spec.linkable and a locateSync() hook`);
 		}
 		this.#handlers.set(scheme.toLowerCase(), handler);
@@ -340,13 +341,12 @@ export class InternalUrlRouter {
 	}
 
 	/**
-	 * Absolute roots of every `sandbox`-scope writable scheme (plan mode keeps them writable), located
-	 * for `context` through {@link locateSync}; {@link register} requires such schemes to be linkable.
+	 * Absolute roots of file-backed sandbox schemes (plan mode keeps them writable).
 	 */
 	sandboxRoots(context?: ResolveContext): string[] {
 		const roots: string[] = [];
 		for (const [scheme, handler] of this.#handlers) {
-			if (handler.spec.write?.scope !== "sandbox") continue;
+			if (handler.spec.write?.scope !== "sandbox" || handler.spec.write.via !== "file") continue;
 			const root = this.locateSync(`${scheme}://`, context);
 			if (root !== undefined) roots.push(path.resolve(root));
 		}

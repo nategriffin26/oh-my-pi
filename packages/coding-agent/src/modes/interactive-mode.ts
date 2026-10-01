@@ -1873,7 +1873,7 @@ export class InteractiveMode implements InteractiveModeContext {
 					this.showModelSelector({ temporaryOnly: true });
 					return;
 				case "status.context":
-					this.handleContextCommand();
+					void this.handleContextCommand();
 					return;
 				case "status.git":
 					this.showGitUi();
@@ -7601,8 +7601,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#commandController.handleToolsCommand();
 	}
 
-	handleContextCommand(): void {
-		this.#commandController.handleContextCommand();
+	handleContextCommand(args?: string): Promise<void> {
+		return this.#commandController.handleContextCommand(args);
 	}
 
 	#vibeSessionTransitionBlocked(): boolean {

@@ -22,10 +22,11 @@ export class DeferredDiagnostics {
 
 		const controller = new AbortController();
 		const mutationVersion = this.#bumpVersion(path);
+		const sessionId = this.session.getSessionId?.();
 		return {
 			onDeferredDiagnostics: diagnostics => {
 				this.#pendingFetches.delete(path);
-				this.#inject(path, diagnostics, mutationVersion);
+				this.#inject(path, diagnostics, mutationVersion, sessionId);
 			},
 			signal: controller.signal,
 			finalize: diagnostics => {
@@ -38,18 +39,30 @@ export class DeferredDiagnostics {
 		};
 	}
 
-	#inject(path: string, diagnostics: FileDiagnosticsResult, mutationVersion: number): void {
+	#inject(
+		path: string,
+		diagnostics: FileDiagnosticsResult,
+		mutationVersion: number,
+		sessionId: string | null | undefined,
+	): void {
+		if (this.#version(path) !== mutationVersion || this.session.getSessionId?.() !== sessionId) return;
 		// Read at delivery time so `lsp.diagnosticsDeduplicate` changes apply to in-flight fetches too.
 		const deduplicate = cfgLspDiagnosticsDeduplicate.get(this.session.settings);
 		const effective = deduplicate ? getDiagnosticsLedger(this.session).reduce(path, diagnostics) : diagnostics;
-		if (deduplicate && effective.messages.length === 0) return;
 
 		const entry: DeferredDiagnosticsEntry = {
+			mutationVersion,
+			snapshot: {
+				summary: diagnostics.summary ?? "",
+				messages: diagnostics.messages ?? [],
+				errored: diagnostics.errored,
+			},
+			suppressed: deduplicate && effective.messages.length === 0,
 			path,
 			summary: effective.summary ?? "",
 			messages: effective.messages ?? [],
 			errored: effective.errored,
-			isStale: () => this.#version(path) !== mutationVersion,
+			isStale: () => this.#version(path) !== mutationVersion || this.session.getSessionId?.() !== sessionId,
 		};
 		this.session.queueDeferredDiagnostics?.(entry);
 	}

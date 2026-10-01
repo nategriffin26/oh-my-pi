@@ -1,3 +1,4 @@
+import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import * as path from "node:path";
 import { logger, Snowflake, workerHostEntry } from "@oh-my-pi/pi-utils";
 import {
@@ -38,6 +39,7 @@ export { rewriteImports, wrapCode } from "./shared/rewrite-imports";
 export type { JsDisplayOutput } from "./worker-protocol";
 
 export interface VmRunState {
+	toolContext?: AgentToolContext;
 	signal?: AbortSignal;
 	onText?: (chunk: string) => void;
 	onDisplay?: (output: JsDisplayOutput) => void;
@@ -820,6 +822,7 @@ async function handleToolCall(session: JsSession, msg: Extract<WorkerOutbound, {
 			session: pending.toolSession,
 			signal: ctrl.signal,
 			identity: msg.identity,
+			toolContext: pending.runState.toolContext,
 			shadowCell: pending.shadowCell,
 			emitStatus: (event: JsStatusEvent) => {
 				trackDeferPhase(pending, event);

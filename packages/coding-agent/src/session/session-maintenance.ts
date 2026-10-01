@@ -24,6 +24,8 @@ import {
 	compactionContextTokens,
 	computeFileLists,
 	createCompactionSummaryMessage,
+	createFileOps,
+	extractFileOpsFromMessage,
 	DEFAULT_SHAKE_CONFIG,
 	type CompactionSettings as EngineCompactionSettings,
 	effectiveReserveTokens,
@@ -72,11 +74,13 @@ import type { CompactOptions, ContextUsage } from "../extensibility/extensions/t
 import type { GoalModeState } from "../goals/state";
 import { resolveMemoryBackend } from "../memory-backend/resolve";
 import type { MemoryBackendOperationContext } from "../memory-backend/types";
+import { isUserTurnInitiator } from "@oh-my-pi/pi-tui/chat/messages";
 import { computeNonMessageTokens, type NonMessageTokenSource } from "@oh-my-pi/pi-tui/status-line/context-usage";
 import { createPlanReadMatcher } from "../plan-mode/plan-protection";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { AgentSessionEvent } from "./agent-session-events";
 import type { ContextUsageBreakdown, HandoffResult, SessionHandoffOptions } from "./agent-session-types";
+import { isClmProtectedControl } from "./clm-state";
 import { findCompactMode } from "./compact-modes";
 import {
 	type CompactionMethod,
@@ -417,6 +421,13 @@ export interface SessionMaintenanceHost {
 	promptGeneration(): number;
 	sessionId(): string;
 	messages(): AgentMessage[];
+	/** Live CLM policy; optional for legacy standalone maintenance hosts. */
+	clmEnabled?(): boolean;
+	commitClmContext?(
+		messages: AgentMessage[],
+		cause: "compact" | "rebase",
+		sourceMessages: AgentMessage[],
+	): Promise<void>;
 	baseSystemPrompt(): string[];
 	goalModeState(): GoalModeState | undefined;
 	planReferencePath(): string;
@@ -569,9 +580,30 @@ export class SessionMaintenance {
 		this.#host = host;
 	}
 
+	/** A persisted projection keeps owning context even after CLM is disabled. */
+	#clmOwnsContext(): boolean {
+		const ownsContext =
+			(this.#host.clmEnabled?.() ?? cfgCompaction.get(this.#host.settings).experimentalClm === true) ||
+			this.#host.sessionManager.getLatestContextProjection() !== undefined;
+		if (ownsContext) {
+			this.cancelSpeculation();
+			this.abortAutomaticCompaction();
+		}
+		return ownsContext;
+	}
+
+	#rejectClmMutation(action: string): void {
+		if (this.#clmOwnsContext()) {
+			throw new Error(
+				`${action} cannot rewrite CLM context. Use /compact to summarize the effective context instead.`,
+			);
+		}
+	}
+
 	/** Experimental rollover is safe only when the current effective tool surface can recover its state. */
 	#usesExperimentalContextManagement(): boolean {
 		return (
+			!this.#clmOwnsContext() &&
 			cfgCompaction.get(this.#host.settings).experimentalContextManagement === true &&
 			this.#host.hasExperimentalContextRolloverTools()
 		);
@@ -672,6 +704,7 @@ export class SessionMaintenance {
 	}
 
 	async #pruneToolOutputs(): Promise<{ prunedCount: number; tokensSaved: number } | undefined> {
+		if (this.#clmOwnsContext()) return undefined;
 		const branchEntries = this.#host.sessionManager.getBranch();
 		const keepBoundaryId = getLatestCompactionEntry(branchEntries)?.firstKeptEntryId;
 		const result = pruneToolOutputs(
@@ -715,6 +748,7 @@ export class SessionMaintenance {
 	 * provider prompt cache.
 	 */
 	async #pruneStaleToolResults(): Promise<{ prunedCount: number; tokensSaved: number } | undefined> {
+		if (this.#clmOwnsContext()) return undefined;
 		const { supersedeReads, dropUseless } = cfgCompaction.get(this.#host.settings);
 		if (!supersedeReads && !dropUseless) return undefined;
 		const branchEntries = this.#host.sessionManager.getBranch();
@@ -760,6 +794,7 @@ export class SessionMaintenance {
 	 * skips the disk rewrite.
 	 */
 	async dropImages(): Promise<{ removed: number }> {
+		this.#rejectClmMutation("Dropping images");
 		const branchEntries = this.#host.sessionManager.getBranch();
 		let removed = 0;
 		for (const entry of branchEntries) {
@@ -821,6 +856,7 @@ export class SessionMaintenance {
 			toolResultsOnly?: boolean;
 		} = {},
 	): Promise<ShakeResult> {
+		this.#rejectClmMutation("Shake");
 		if (mode === "images") {
 			const { removed } = await this.#host.dropImages();
 			return { mode, toolResultsDropped: 0, blocksDropped: 0, imagesDropped: removed, tokensFreed: 0 };
@@ -876,6 +912,7 @@ export class SessionMaintenance {
 		}
 
 		const assertCurrent = () => {
+			this.#rejectClmMutation("Shake");
 			if (opts.signal?.aborted || opts.isCurrent?.() === false) throw new CompactionCancelledError();
 		};
 		assertCurrent();
@@ -1006,6 +1043,7 @@ export class SessionMaintenance {
 
 	/** One-shot, artifact-backed mechanical reduction for a pre-output Responses body-read timeout. */
 	async shakeForRequestBodyReadTimeout(generation: number): Promise<boolean> {
+		if (this.#clmOwnsContext()) return false;
 		const settings = cfgCompaction.get(this.#host.settings);
 		if (!settings.enabled || !resolveCompactionMethodOrder(settings.methodOrder).includes("shake")) return false;
 		const isCurrent = () => !this.#host.isDisposed() && this.#host.promptGeneration() === generation;
@@ -1051,6 +1089,60 @@ export class SessionMaintenance {
 		}
 	}
 
+	/** Manual rescue never prepares from execution history or creates a native capsule. */
+	async #compactClmContext(customInstructions: string | undefined, signal: AbortSignal): Promise<CompactionResult> {
+		const commit = this.#host.commitClmContext;
+		if (!commit) throw new Error("This session cannot commit a CLM context projection.");
+		const sourceMessages = structuredClone(this.#host.messages());
+		const latestCompaction = getLatestCompactionEntry(this.#host.sessionManager.getBranch());
+		const nativeBoundary =
+			this.#host.sessionManager.getLatestContextProjection() === undefined &&
+			(getOpenAiRemoteCompactionPayload(latestCompaction) !== undefined ||
+				isRecord(latestCompaction?.preserveData?.anthropicCompaction));
+		if (
+			nativeBoundary ||
+			sourceMessages.some(message => message.role === "compactionSummary" && message.providerPayload !== undefined)
+		) {
+			throw new Error(
+				"Cannot faithfully summarize the current provider-native context for CLM. The native context is unchanged; raw history will not be expanded.",
+			);
+		}
+		if (sourceMessages.length === 0)
+			throw new ManualCompactionNoOpError("Nothing to compact (empty effective context)");
+		const sourceEntryId = this.#host.sessionManager.getLeafId();
+		if (!sourceEntryId) throw new Error("Cannot compact CLM context before its source messages are persisted.");
+		const fileOps = createFileOps();
+		for (const message of sourceMessages) extractFileOpsFromMessage(message, fileOps);
+		const preparation: CompactionPreparation = {
+			firstKeptEntryId: sourceEntryId,
+			messagesToSummarize: sourceMessages,
+			turnPrefixMessages: [],
+			recentMessages: [],
+			isSplitTurn: false,
+			tokensBefore: this.#tokenizer.countMessages(sourceMessages),
+			fileOps,
+			settings: { ...resolveMethodSettings(cfgCompaction.get(this.#host.settings), "soft"), remoteEnabled: false },
+		};
+		const result = await this.#compactWithFallbackModel(preparation, customInstructions, signal);
+		if (signal.aborted) throw new CompactionCancelledError(undefined, { cause: signal.reason });
+		if (!result.summary.trim())
+			throw new Error("CLM compaction did not produce a readable summary; context is unchanged.");
+		const currentUserIndex = sourceMessages.findLastIndex(
+			message =>
+				(message.role === "user" && message.attribution !== "agent") ||
+				(message.role === "custom" && isUserTurnInitiator(message)),
+		);
+		const retainedAuthority = sourceMessages.filter(
+			(message, index) => isClmProtectedControl(message) || index === currentUserIndex,
+		);
+		const successor: AgentMessage[] = [
+			...retainedAuthority,
+			createCompactionSummaryMessage(result.summary, result.tokensBefore, new Date().toISOString()),
+		];
+		await commit.call(this.#host, successor, "compact", sourceMessages);
+		return { ...result, preserveData: undefined };
+	}
+
 	/**
 	 * Manually compact the session context.
 	 * Aborts current agent operation first.
@@ -1075,6 +1167,10 @@ export class SessionMaintenance {
 		// Resolve the `/compact <mode>` subcommand up front so input validation
 		// runs before we disconnect/abort the active agent operation below.
 		const compactMode = options?.mode ? findCompactMode(options.mode) : undefined;
+		const clmContext = this.#clmOwnsContext();
+		if (clmContext && options?.mode && compactMode?.name !== "soft") {
+			throw new Error("CLM context supports only readable /compact summaries, not remote or snapcompact modes.");
+		}
 		// Modes that produce no LLM summary (snapcompact) have nothing to focus.
 		// Reject focus text loudly so programmatic callers don't silently lose
 
@@ -1137,6 +1233,7 @@ export class SessionMaintenance {
 				this.#host.disconnectFromAgent();
 				await this.#host.abort({ goalReason: "internal", preserveCompaction: true });
 				resumeInterruptedTurn =
+					!clmContext &&
 					(interruptedActiveTurn || inheritedResume) &&
 					options?.suppressContinuation !== true &&
 					cfgCompactionAutoContinue.get(this.#host.settings) !== false;
@@ -1145,6 +1242,16 @@ export class SessionMaintenance {
 			const activeModel = this.#model;
 			if (!activeModel) {
 				throw new Error("No model selected");
+			}
+			if (clmContext || this.#clmOwnsContext()) {
+				resumeInterruptedTurn = false;
+				const result = await this.#compactClmContext(
+					options?.internalGuidance ?? customInstructions,
+					compactionAbortController.signal,
+				);
+				markCommitted();
+				options?.onComplete?.(result);
+				return result;
 			}
 			if (
 				this.#usesExperimentalContextManagement() &&
@@ -1908,6 +2015,7 @@ export class SessionMaintenance {
 	 * the turn was cut mid-run, so there is no finished answer to preserve.
 	 */
 	#scheduleInterruptedTurnResume(generation: number): void {
+		if (this.#clmOwnsContext()) return;
 		this.#host.scheduleCompactionContinuation({
 			generation,
 			autoContinue: true,
@@ -1988,6 +2096,7 @@ export class SessionMaintenance {
 
 	/** Trigger idle compaction through the auto-compaction flow (with UI events). */
 	async runIdleCompaction(): Promise<void> {
+		if (this.#clmOwnsContext()) return;
 		if (this.#host.isStreaming() || this.isCompacting) return;
 		await this.runAutoCompaction("idle", false, true);
 	}
@@ -2000,6 +2109,7 @@ export class SessionMaintenance {
 	 * messages through the cache-friendly side-request pipeline.
 	 */
 	async handoff(customInstructions?: string, options?: SessionHandoffOptions): Promise<HandoffResult | undefined> {
+		this.#rejectClmMutation("Handoff");
 		if (this.isCompacting) throw new Error("Compaction already in progress");
 		this.cancelSpeculation();
 		const model = this.#model;
@@ -2045,6 +2155,7 @@ export class SessionMaintenance {
 	 * {@link deferThresholdCompactionToSpeculation}'s grace band instead.
 	 */
 	maybeStartSpeculativeCompaction(contextTokens: number, contextWindow: number): void {
+		if (this.#clmOwnsContext()) return;
 		if (contextWindow <= 0 || this.#host.isDisposed()) return;
 		const settings = cfgCompaction.get(this.#host.settings);
 		if (this.#usesExperimentalContextManagement()) {
@@ -2142,6 +2253,7 @@ export class SessionMaintenance {
 	 * extension must keep exact blocking semantics.
 	 */
 	deferThresholdCompactionToSpeculation(contextTokens: number, contextWindow: number): boolean {
+		if (this.#clmOwnsContext()) return false;
 		if (contextWindow <= 0 || this.#host.isDisposed()) return false;
 		const settings = cfgCompaction.get(this.#host.settings);
 		if (this.#usesExperimentalContextManagement()) return false;
@@ -2392,6 +2504,7 @@ export class SessionMaintenance {
 		advisorResetReason: string;
 		detachExtensionEmit?: boolean;
 	}): Promise<CompactionEntry | undefined> {
+		this.#rejectClmMutation("Legacy compaction");
 		const entryId = this.#host.sessionManager.appendCompaction(
 			args.summary,
 			args.shortSummary,
@@ -2518,6 +2631,7 @@ export class SessionMaintenance {
 	}
 
 	async runPrePromptCompactionIfNeeded(messages: AgentMessage[]): Promise<void> {
+		if (this.#clmOwnsContext()) return;
 		const model = this.#model;
 		if (!model) return;
 		const contextWindow = model.contextWindow ?? 0;
@@ -2592,6 +2706,7 @@ export class SessionMaintenance {
 		signal: AbortSignal | undefined,
 		context: AgentTurnEndContext | undefined,
 	): Promise<void> {
+		if (this.#clmOwnsContext()) return;
 		if (
 			signal?.aborted ||
 			this.#host.isDisposed() ||
@@ -2771,6 +2886,11 @@ export class SessionMaintenance {
 		allowDefer = true,
 		autoContinue = true,
 	): Promise<CompactionCheckResult> {
+		if (this.#clmOwnsContext()) {
+			return assistantMessage.stopReason === "error" || assistantMessage.stopReason === "length"
+				? COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION
+				: COMPACTION_CHECK_NONE;
+		}
 		// Skip if message was aborted (user cancelled) - unless skipAbortedCheck is false
 		if (skipAbortedCheck && assistantMessage.stopReason === "aborted") return COMPACTION_CHECK_NONE;
 		const contextWindow = this.#model?.contextWindow ?? 0;
@@ -4197,6 +4317,7 @@ export class SessionMaintenance {
 			excludeMediaMethods?: boolean;
 		} = {},
 	): Promise<CompactionCheckResult> {
+		if (this.#clmOwnsContext()) return COMPACTION_CHECK_NONE;
 		const compactionSettings = cfgCompaction.get(this.#host.settings);
 		// An explicit model-requested rollover bypasses the Auto-Compact toggle;
 		// automatic threshold rollover stays gated exactly as before.

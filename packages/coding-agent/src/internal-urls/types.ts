@@ -141,6 +141,8 @@ export interface LocateOptions {
  * process facts (binary presence) in {@link ProtocolHandler.promptDoc}.
  */
 export interface SchemeHost {
+	/** This host actually exposes an enabled, session-owned CLM capability. */
+	clmEnabled?: boolean;
 	/** Loaded skills are readable through an active tool. */
 	skillUriAccess: boolean;
 	/** Number of rulebook rules addressable through rule://. */
@@ -314,6 +316,11 @@ export interface ResolveContext {
 	 * reject directory resources, so they never need the listing.
 	 */
 	skipDirectoryListing?: boolean;
+	/**
+	 * The read slices lines after the first one (a later page or a tail), so a
+	 * snapshot-backed handler must serve the snapshot the earlier pages came from.
+	 */
+	continuesLines?: boolean;
 }
 
 /**

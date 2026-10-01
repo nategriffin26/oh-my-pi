@@ -47,6 +47,8 @@ export type ReadTruncationStats = Omit<TruncationResult, "content">;
 /** Display metadata for file and URL reads. */
 export interface ReadToolDetails {
 	kind?: "file" | "url";
+	/** The captured display content is an explicit raw read, without summaries or elisions. */
+	raw?: boolean;
 	proc?: ProcReadDetails;
 	cfg?: CfgReadDetails;
 	/** Filesystem hyperlink target resolved by the executing tool. */

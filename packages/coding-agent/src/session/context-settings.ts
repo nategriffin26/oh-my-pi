@@ -75,6 +75,18 @@ export const cfgCompactionExperimentalContextManagement = register({
 	},
 });
 
+export const cfgCompactionExperimentalClm = register({
+	id: "compaction.experimentalClm",
+	type: "boolean",
+	default: false,
+	ui: {
+		tab: "context",
+		group: "Compaction",
+		label: "Context document management (experimental)",
+		description: "Let the model manage completed context through a transactional context document.",
+	},
+});
+
 export const cfgCompactionMidTurnEnabled = register({
 	id: "compaction.midTurnEnabled",
 	type: "boolean",
@@ -304,6 +316,7 @@ export const cfgCompactionDropUseless = register({
 export const cfgCompaction = combine({
 	enabled: cfgCompactionEnabled,
 	experimentalContextManagement: cfgCompactionExperimentalContextManagement,
+	experimentalClm: cfgCompactionExperimentalClm,
 	methodOrder: cfgCompactionMethodOrder,
 	thresholdPercent: cfgCompactionThresholdPercent,
 	thresholdTokens: cfgCompactionThresholdTokens,

@@ -280,6 +280,8 @@ export class ChatTranscriptBuilder {
 	}
 
 	#appendChatMessage(message: AgentMessage): void {
+		// Projection-only context must not create transcript rows or disturb execution grouping.
+		if (message.role === "clmNote") return;
 		if (message.role !== "toolResult") this.#flushPendingUsage();
 		if (message.role !== "assistant" && message.role !== "toolResult") {
 			this.#readGroup?.seal();

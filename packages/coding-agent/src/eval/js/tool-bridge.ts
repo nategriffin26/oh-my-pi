@@ -1,4 +1,4 @@
-import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import type { AgentTool, AgentToolContext, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { toolWireSchema, validateToolArguments } from "@oh-my-pi/pi-ai";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
@@ -36,6 +36,7 @@ export type { JsStatusEvent } from "./shared/types";
 
 export interface ToolBridgeOptions {
 	session: ToolSession;
+	toolContext?: AgentToolContext;
 	signal?: AbortSignal;
 	emitStatus?: (event: JsStatusEvent) => void;
 	defaultIntent?: string;
@@ -171,14 +172,39 @@ export function bridgeValueFromToolResult(
 		(content): content is { type: "image"; mimeType: string; data: string } =>
 			content.type === "image" && typeof content.mimeType === "string" && typeof content.data === "string",
 	);
-	const text = textBlocks.map(block => block.text).join("");
+	let text = textBlocks.map(block => block.text).join("");
+	let details = result.details;
 	const hasError = toolResultHasError(result);
+	// Code consumes the complete raw source, not a presentation preview or its paging footer.
+	// Partial reads retain their normal limits; context://self:raw is an unbounded snapshot.
+	if (name === "read" && !hasError && isRecord(details) && details.raw === true) {
+		const display = details.displayContent;
+		const truncated = isRecord(details.truncation) && details.truncation.truncated === true;
+		if (
+			!truncated &&
+			isRecord(display) &&
+			typeof display.text === "string" &&
+			display.startLine === 1 &&
+			Array.isArray(display.lineNumbers) &&
+			display.lineNumbers.length === details.totalLines &&
+			display.lineNumbers.at(-1) === details.totalLines
+		) {
+			text = display.text;
+			const { displayContent: _display, ...rest } = details;
+			// Do not serialize a second copy of the full body or advertise display-only truncation.
+			if (isRecord(rest.meta)) {
+				const { truncation: _truncation, ...meta } = rest.meta;
+				rest.meta = meta;
+			}
+			details = rest;
+		}
+	}
 	if (emitStatus) {
 		const event = summarize(name, args, result, text, hasError);
 		if (event) emitStatus(event);
 	}
-	if (result.details === undefined && imageBlocks.length === 0 && !hasError) return text;
-	const value: Exclude<ToolValue, string> = { text, details: result.details };
+	if (details === undefined && imageBlocks.length === 0 && !hasError) return text;
+	const value: Exclude<ToolValue, string> = { text, details };
 	if (imageBlocks.length > 0) {
 		value.images = imageBlocks.map(block => ({ mimeType: block.mimeType, data: block.data }));
 	}
@@ -206,6 +232,17 @@ function waitForSpeculativeClaim<T>(claim: Promise<T>, signal?: AbortSignal): Pr
 		error => finish(() => reject(error)),
 	);
 	return promise;
+}
+
+/**
+ * A bridged call is its own one-call batch: it keeps the root eval call's identity (CLM transaction ids)
+ * but never joins the root's LSP batch, steering, or additional-context sink.
+ */
+function bridgedToolContext(context: AgentToolContext | undefined, toolCallId: string): AgentToolContext | undefined {
+	const root = context?.toolCall;
+	if (!context || !root) return context;
+	const call = root.toolCalls[root.index];
+	return { ...context, toolCall: { batchId: toolCallId, index: 0, total: 1, toolCalls: call ? [call] : [] } };
 }
 
 export async function callSessionTool(name: string, args: unknown, options: ToolBridgeOptions): Promise<ToolValue> {
@@ -327,7 +364,7 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 			normalizedArgs,
 			options.signal,
 			undefined,
-			options.session.getToolContext?.(),
+			bridgedToolContext(options.toolContext ?? options.session.getToolContext?.(), toolCallId),
 		);
 		if (name === "todo") {
 			// A bridged call emits no `todo` toolResult entry, the only thing branch

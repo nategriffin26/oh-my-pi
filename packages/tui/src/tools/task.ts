@@ -2159,7 +2159,16 @@ export interface TaskItem {
 	tools?: string[];
 	/** Run this spawn in an isolated worktree (batch form; flat form carries it top-level). */
 	isolated?: boolean;
+	/** Parent archive refs copied verbatim into the child: `h<id>` archive ids or `b<N>` blocks of the latest context://self snapshot, optional `:N-M` line range. */
+	handoff?: string[];
+	/** `curated` (default for CLM parents): seed + archive index; `brief`: assignment + shared context only; `fork`: child starts from the parent's persisted transcript. */
+	handoffMode?: TaskHandoffMode;
+	/** Auto-pin the parent's user requirement messages into the handoff seed (default true). */
+	pinRequirements?: boolean;
 }
+
+/** How much parent context a spawned child receives. */
+export type TaskHandoffMode = "curated" | "brief" | "fork";
 
 /**
  * Runtime params union over both wire shapes. The model sees exactly one shape
@@ -2190,6 +2199,12 @@ export interface TaskParams {
 	context?: string;
 	/** Run in an isolated worktree (flat form; per-item in batch form). */
 	isolated?: boolean;
+	/** Parent archive refs (flat form); see {@link TaskItem.handoff}. */
+	handoff?: string[];
+	/** Handoff mode (flat form); see {@link TaskItem.handoffMode}. */
+	handoffMode?: TaskHandoffMode;
+	/** Requirement pinning (flat form); see {@link TaskItem.pinRequirements}. */
+	pinRequirements?: boolean;
 }
 
 /**

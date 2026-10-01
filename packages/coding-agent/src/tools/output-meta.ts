@@ -15,6 +15,7 @@ import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { isRecord, logger } from "@oh-my-pi/pi-utils";
 import type { Setting } from "../config/registry";
 import type { Settings } from "../config/settings";
+import type { ReadonlySessionManager } from "../session/session-manager";
 
 import {
 	type OutputSummary,
@@ -415,7 +416,7 @@ export function outputMeta(): OutputMetaBuilder {
 /**
  * Append output notice to tool result content if meta is present.
  */
-function appendOutputNotice(
+export function appendOutputNotice(
 	content: (TextContent | ImageContent)[],
 	meta: OutputMeta | undefined,
 ): (TextContent | ImageContent)[] {
@@ -441,8 +442,16 @@ const kUnwrappedExecute = Symbol("OutputMeta.UnwrappedExecute");
 // Centralized artifact spill for large tool results
 // =============================================================================
 
+/** Byte/line sizes of an artifact spill: spill above `threshold`, keep a head/tail preview inline. */
+export interface ArtifactSpillConfig {
+	threshold: number;
+	tailBytes: number;
+	tailLines: number;
+	headBytes: number;
+}
+
 /** Resolved artifact spill config sourced from the session settings (or schema defaults). */
-function getSpillConfig(s: Settings | undefined) {
+function getSpillConfig(s: Settings | undefined): ArtifactSpillConfig {
 	const get = (setting: Setting<number>) => (s ? setting.get(s) : setting.default);
 	return {
 		threshold: get(cfgToolsArtifactSpillThreshold) * 1024,
@@ -504,8 +513,21 @@ async function spillLargeResultToArtifact(
 ): Promise<AgentToolResult> {
 	const sessionManager = context?.sessionManager;
 	if (!sessionManager) return result;
-	const { threshold, tailBytes, tailLines, headBytes } = getSpillConfig(context?.settings);
+	return spillToolResultToArtifact(result, toolName, sessionManager, getSpillConfig(context?.settings));
+}
 
+/**
+ * Artifact spill with explicit sizes: results above `threshold` bytes keep a
+ * `headBytes`/`tailBytes` preview inline and move the full text to an artifact.
+ * CLM over-capacity recovery calls this with a zero threshold and a small
+ * preview; tool wrappers use the session's configured sizes.
+ */
+export async function spillToolResultToArtifact(
+	result: AgentToolResult,
+	toolName: string,
+	sessionManager: Pick<ReadonlySessionManager, "saveArtifact">,
+	{ threshold, tailBytes, tailLines, headBytes }: ArtifactSpillConfig,
+): Promise<AgentToolResult> {
 	// Skip if tool already saved an artifact
 	const existingMeta: OutputMeta | undefined = result.details?.meta;
 	if (existingMeta?.truncation?.artifactId) return result;
