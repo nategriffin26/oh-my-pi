@@ -390,6 +390,7 @@ export interface InteractiveModeContext {
 		options?: {
 			imageLinks?: readonly (string | undefined)[];
 			reuseSettledComponent?: boolean;
+			appendTo?: (component: Component) => void;
 		},
 	): Component[];
 	renderSessionContext(sessionContext: SessionContext, options?: RenderSessionContextOptions): void;
@@ -429,7 +430,7 @@ export interface InteractiveModeContext {
 	handleChangelogCommand(args?: string): Promise<void>;
 	handleHotkeysCommand(): void;
 	handleToolsCommand(): void;
-	handleContextCommand(): void;
+	handleContextCommand(args?: string): Promise<void>;
 	handleDumpCommand(): Promise<void>;
 	handleAdvisorDumpCommand(isRaw?: boolean): void;
 	handleDebugTranscriptCommand(): Promise<void>;

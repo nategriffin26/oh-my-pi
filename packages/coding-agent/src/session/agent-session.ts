@@ -18,6 +18,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
 import { isPromise } from "node:util/types";
+import { invalidateMessageCache } from "@oh-my-pi/pi-agent-core/compaction/message-cache";
 
 import {
 	type AfterToolCallContext,
@@ -26,6 +27,7 @@ import {
 	AgentBusyError,
 	type AgentEvent,
 	type AgentMessage,
+	type AgentRequestAdmission,
 	type AgentState,
 	type AgentTool,
 	type AgentToolCall,
@@ -42,6 +44,8 @@ import {
 	type StreamFn,
 	TERMINAL_TOOL_RESULT_ABORT_REASON,
 	type ThinkingLevel,
+	Tokenizer,
+	tokenizerEncodingForModel,
 	type ToolChoiceDirective,
 } from "@oh-my-pi/pi-agent-core";
 import {
@@ -50,6 +54,8 @@ import {
 	calculatePromptTokens,
 	collectEntriesForBranchSummary,
 	generateBranchSummary,
+	isTranscriptUsageAnchor,
+	resolveThresholdTokens,
 	type ShakeConfig,
 } from "@oh-my-pi/pi-agent-core/compaction";
 import type {
@@ -189,6 +195,7 @@ import goalTodoContextPrompt from "../prompts/goals/goal-todo-context.md" with {
 import anthropicUsageWrapUpPrompt from "../prompts/system/anthropic-usage-wrap-up.md" with { type: "text" };
 import autoContinuePrompt from "../prompts/system/auto-continue.md" with { type: "text" };
 import checkpointActiveNoticeTemplate from "../prompts/system/checkpoint-active-notice.md" with { type: "text" };
+import clmFeedbackNoticeTemplate from "../prompts/system/clm-feedback-notice.md" with { type: "text" };
 import interruptedThinkingTemplate from "../prompts/system/interrupted-thinking.md" with { type: "text" };
 import planModeActivePrompt from "../prompts/system/plan-mode-active.md" with { type: "text" };
 import planModeReferencePrompt from "../prompts/system/plan-mode-reference.md" with { type: "text" };
@@ -232,6 +239,7 @@ import {
 import type { CheckpointState, CompletedRewindState } from "../tools/checkpoint";
 import { releaseComputerSessionsForOwner } from "../tools/computer/supervisor";
 import { isAutoQaEnabled } from "../tools/report-tool-issue";
+import { type ArtifactSpillConfig, appendOutputNotice, spillToolResultToArtifact } from "../tools/output-meta";
 import {
 	buildResolveReminderMessage,
 	isPreviewResolutionToolCall,
@@ -325,6 +333,17 @@ import {
 	shouldPromptCodexAutoRedeem,
 } from "./codex-auto-reset";
 import { recordCredentialPin, seedCredentialPins } from "./credential-pin";
+import { ClmContext } from "./clm-context";
+import {
+	type ClmBudgetEstimate,
+	type ClmBudgetInputs,
+	ClmBudgetTracker,
+	type ClmCapacity,
+	ClmCapacityError,
+} from "./clm-budget";
+import { assertClmMessages, CLM_FEEDBACK_MESSAGE_TYPE } from "./clm-state";
+import type { ClmPressureNotice } from "@oh-my-pi/pi-tui/chat/clm-notice";
+import type { ClmActivity, ClmContextAccess, ClmContextInspector, ClmFeedbackDetails, ClmReceipt } from "./clm-types";
 import { EvalRunner, type EvalRunnerHost } from "./eval-runner";
 import {
 	collectPendingToolCalls,
@@ -354,6 +373,7 @@ import {
 	didSessionMessagesChange,
 	type FileMentionMessage,
 	type HookMessage,
+	invalidateConvertToLlmArrayCache,
 	INTERRUPTED_THINKING_MESSAGE_TYPE,
 	type InterruptedThinkingDetails,
 	isEmptyErrorTurn,
@@ -397,7 +417,7 @@ import { getRestorableSessionModels, isTranscriptEntry } from "./session-context
 import type { CacheWarmer, CacheWarmingMode, CacheWarmingStatus } from "./cache-warmer";
 import { isUserRequestEntry, transcriptEntryMessage, userTurnDraft } from "@oh-my-pi/pi-tui/chat/transcript-entry";
 import { formatSessionDumpText } from "./session-dump-format";
-import type { BranchSummaryEntry, NewSessionOptions } from "./session-entries";
+import type { BranchSummaryEntry, NewSessionOptions, SessionMessageEntry } from "./session-entries";
 import { SessionHandoff, type SessionHandoffHost } from "./session-handoff";
 import {
 	COMPACTION_CHECK_NONE,
@@ -470,6 +490,9 @@ import {
 } from "../modes/settings";
 import { cfgTaskBatch, cfgTaskDisabledAgents } from "../task/settings";
 import {
+	cfgCompaction,
+	cfgCompactionExperimentalClm,
+	cfgCompactionClmRecallRerank,
 	cfgBranchSummaryReserveTokens,
 	cfgExtendedContext,
 	cfgWorkspaceAdditionalDirectories,
@@ -503,6 +526,14 @@ const POST_PROMPT_DRAIN_TIMEOUT_MS = 5_000;
 const AGENT_START_POLICY_MAX_ATTEMPTS = 3;
 /** Vision descriptions gate admission; stay under the RPC clients' 30 s request timeout. */
 const IMAGE_DESCRIPTION_ADMISSION_TIMEOUT_MS = 20_000;
+/** Smallest reply CLM still dispatches when the request crowds out the configured output cap. */
+const CLM_MIN_REPLY_TOKENS = 4096;
+/** Recent requests whose estimate growth sizes the batch-aware pressure line. */
+const CLM_GROWTH_WINDOW = 8;
+/** Undelivered CLM host feedback kept for the next request; the oldest is dropped first. */
+const CLM_FEEDBACK_LIMIT = 8;
+/** Over-capacity spill keeps a small inline preview; the artifact holds the full output. */
+const CLM_SPILL_PREVIEW: ArtifactSpillConfig = { threshold: 4096, headBytes: 2048, tailBytes: 2048, tailLines: 40 };
 
 /** A failed preparation, not a provider failure: the ordinary input can still be restored. */
 class AgentStartPolicyChangedError extends Error {
@@ -793,6 +824,33 @@ export class AgentSession implements SettingsScope {
 	#movedFromEmptySessionFile?: string;
 
 	readonly #maintenance: SessionMaintenance;
+	readonly #clm: ClmContext;
+	readonly #clmBudget = new ClmBudgetTracker(() => {
+		const model = this.model;
+		if (!this.#clmTokenizer || this.#clmTokenizer.encoding !== tokenizerEncodingForModel(model)) {
+			this.#clmTokenizer = new Tokenizer(model, { nativeFallback: true });
+		}
+		return this.#clmTokenizer;
+	});
+	#clmTokenizer: Tokenizer | undefined;
+	#clmPressureRevision: string | undefined;
+	#clmUrgentKey: string | undefined;
+	/** Host feedback for the next naturally occurring provider request, stamped with its source owner/generation. */
+	#clmFeedback: Array<{
+		owner: string;
+		generation: number;
+		text: string;
+		finalizeReplyCap?: boolean;
+		/** The transcript activity this text reported live (chip or rejected receipt), journaled with it. */
+		activity?: ClmActivity;
+	}> = [];
+	#clmPendingCapNotice: { notice: CustomMessage; message: string; detail?: ClmPressureNotice } | undefined;
+	#clmActivityListeners: Array<(activity: ClmActivity) => void> = [];
+	/** User message that started the current or most recent `prompt()` run; CLM pins it like a human request. */
+	#clmRunInitiator: AgentMessage | undefined;
+	#clmLastEstimate: number | undefined;
+	/** Positive per-request estimate growth of recent requests, so pressure covers one more tool batch. */
+	#clmRecentGrowth: number[] = [];
 
 	// Branch summarization state
 	#branchSummaryAbortController: AbortController | undefined = undefined;
@@ -922,6 +980,7 @@ export class AgentSession implements SettingsScope {
 
 	#transformContext: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
 	#onPayload: SimpleStreamOptions["onPayload"] | undefined;
+	readonly #providerPayloadIsUnmodified: () => boolean;
 	#onResponse: SimpleStreamOptions["onResponse"] | undefined;
 	/**
 	 * Providers/models (`${provider}/${id}`) whose runtime context window has
@@ -1715,6 +1774,8 @@ export class AgentSession implements SettingsScope {
 		this.#transformContext = config.transformContext ?? (messages => messages);
 		this.#sideStreamFn = config.sideStreamFn ?? streamSimple;
 		this.#onPayload = config.onPayload;
+		this.#providerPayloadIsUnmodified =
+			config.providerPayloadIsUnmodified ?? (() => !config.onPayload && !this.agent.hasProviderPayloadInterceptor);
 		this.rawSseDebugBuffer = config.rawSseDebugBuffer ?? new RawSseDebugBuffer();
 		// Avoid wrapping in an `async` closure when no user callback is configured: the
 		// outer await on `#onResponse` (provider-response.ts) tolerates a sync void return,
@@ -1747,13 +1808,17 @@ export class AgentSession implements SettingsScope {
 		this.agent.setProviderResponseInterceptor(this.#onResponse);
 		this.agent.setRawSseEventInterceptor(this.#onSseEvent);
 		this.agent.setOnTurnEnd(async (messages, signal, context) => {
-			if (signal?.aborted) return;
+			if (signal?.aborted) {
+				this.#clm.discard("turn aborted");
+				return;
+			}
 			const rewindReport = this.#extractRewindReport(messages);
 			if (rewindReport) {
 				this.#pendingRewindReport = undefined;
 				await this.#applyRewind(rewindReport, messages, context);
 			}
 			this.#loopGuards.recordTurn(messages, context);
+			await this.#clm.commitBoundary(messages, signal, context);
 			await this.#prewalk.advanceAtTurnEnd(messages, context);
 			if (context?.willContinue) this.#steerAnthropicWrapUp();
 			await this.#advisors.onPrimaryTurnEnd(messages, context?.willContinue, signal);
@@ -1814,6 +1879,8 @@ export class AgentSession implements SettingsScope {
 		this.agent.setAsideMessageProvider(() => {
 			const thunks: AsideMessage[] = this.#irc.drainPending().map(record => () => record);
 			thunks.push(...this.yieldQueue.drainLazy());
+			// CLM host feedback rides with request admission (`#admitClmRequest`), not here: asides only
+			// drain after tool batches, which misses the first request of a prompt.
 			// Mid-run todo reconciliation — evaluated at injection time so a turn
 			// that flips a todo just before this poll suppresses the nudge.
 			thunks.push(() => this.#todo.takeMidRunNudge());
@@ -2107,6 +2174,9 @@ export class AgentSession implements SettingsScope {
 			goalModeState: () => this.#goalModeState,
 			planReferencePath: () => this.#planReferencePath,
 			nonMessageTokenSource: () => this,
+			clmEnabled: () => cfgCompaction.get(this.settings).experimentalClm === true,
+			commitClmContext: (messages, cause, sourceMessages) =>
+				this.#clm.commitExternal(messages, cause, sourceMessages),
 			hasExperimentalContextRolloverTools: () => {
 				const enabled = this.#tools.getEnabledToolNames();
 				for (const name in EXPERIMENTAL_CONTEXT_REQUIRED_TOOLS) {
@@ -2180,6 +2250,141 @@ export class AgentSession implements SettingsScope {
 			abortHandoff: () => this.abortHandoff(),
 		};
 		this.#maintenance = new SessionMaintenance(maintenanceHost);
+		this.#clm = new ClmContext({
+			manager: this.sessionManager,
+			enabled: () => this.#isClmEnabled(),
+			epoch: () => `${this.#sessionGeneration}:${this.#promptGeneration}`,
+			ownerGeneration: () => this.#promptGeneration,
+			isDisposed: () => this.#isDisposed,
+			isStreaming: () => this.isStreaming || this.#admittedSubmissionCount > 0 || this.isCompacting,
+			model: () => this.model,
+			messages: () => this.agent.state.messages,
+			protectedMessages: () => (this.#clmRunInitiator ? [this.#clmRunInitiator] : []),
+			estimate: messages => this.#clmBudget.estimate(this.#clmBudgetInputs(messages)).estimatedRequestTokens,
+			assertFits: messages => {
+				const candidate = this.#clmBudget.estimate(this.#clmBudgetInputs(messages));
+				// An edit that does not grow the request is the way out of over capacity; never refuse it.
+				const live = this.#clmBudget.estimate(this.#clmBudgetInputs(this.agent.state.messages));
+				if (candidate.localRequestTokens > live.localRequestTokens) this.#assertClmFits(candidate);
+			},
+			budget: () => {
+				const estimate = this.#clmBudget.estimate(this.#clmBudgetInputs(this.agent.state.messages));
+				const observed = this.agent.state.messages.findLast(isTranscriptUsageAnchor);
+				return {
+					...estimate,
+					...this.#clmCapacity(estimate),
+					lastObservedUsage:
+						observed?.role === "assistant"
+							? {
+									promptTokens: calculatePromptTokens(observed.usage),
+									provider: observed.provider,
+									model: observed.model,
+									timestamp: observed.timestamp,
+									historical: true,
+								}
+							: null,
+				};
+			},
+			persistTurn: context => this.#persistTurnMessagesForMidRunCompaction(context),
+			publish: (messages, activeMessages, pendingRequestMessages) => {
+				this.agent.replaceMessages(messages);
+				if (activeMessages && activeMessages !== messages) {
+					activeMessages.splice(0, activeMessages.length, ...messages, ...(pendingRequestMessages ?? []));
+					invalidateConvertToLlmArrayCache(activeMessages);
+				}
+				this.#closeAllProviderSessions("CLM context revision");
+				this.#stats.rebaseAfterCompaction();
+				this.#advisors.resetAllRuntimes("CLM context revision");
+				this.#planReferenceSent = false;
+				this.#memory.clearPromotionSnapshot();
+			},
+			notice: (level, message, generation, receipt) =>
+				this.#notifyClm(level, message, generation, false, undefined, receipt),
+			receipt: receipt => this.#emitClmActivity({ type: "receipt", receipt }),
+			tokenizer: () => this.#clmBudget.tokenizer(),
+			// Only calibrated native probabilities rerank; a chat fallback's one-hot answers would not.
+			recallJudge: () => {
+				if (cfgCompactionClmRecallRerank.get(this.settings) === "lexical")
+					return "compaction.clmRecallRerank is lexical";
+				return hasNativeJudge(this.settings, this.#modelRegistry)
+					? resolveJudge({
+							settings: this.settings,
+							registry: this.#modelRegistry,
+							sessionModel: this.model,
+							sessionId: this.sessionId,
+							metadataResolver: provider => this.agent.metadataForProvider(provider),
+							purpose: "recall",
+							onUsage: journalJudgmentUsage(this.sessionManager),
+							telemetry: this.agent.telemetry,
+							cache: sharedJudgmentCache(),
+						})
+					: undefined;
+			},
+		});
+		this.addDisposer(
+			this.agent.addBeforeModelCallHook((signal, messages) =>
+				this.#clm.retireDiagnostics(this.agent.state.messages, signal, undefined, messages),
+			),
+		);
+		cfgCompactionExperimentalClm.listen(this, () => {
+			this.#clm.discard("CLM mode changed");
+			this.#maintenance.cancelSpeculation();
+		});
+		// Capacity, pressure, and queued host feedback are decided before conversion, so a warning
+		// rides with the request that crossed its line and a receipt with the next natural request.
+		this.agent.setRequestAdmission((messages, signal) => this.#admitClmRequest(messages, signal));
+		this.addDisposer(
+			this.agent.addBeforeModelCall((context, _signal, request) => {
+				this.#clm.assertHealthy();
+				if (!this.#clm.isEnabled()) return;
+				this.#maintenance.cancelSpeculation();
+				assertClmMessages(this.agent.state.messages);
+				const inputs = this.#clmBudgetInputs(request.messages, context, request.model);
+				let estimate = this.#clmBudget.estimate(inputs);
+				const initialCap = request.maxTokens;
+				this.#assertClmFits(estimate, request.model, initialCap);
+				const { contextWindow, generationReserveTokens } = this.#clmCapacity(estimate, request.model, initialCap);
+				let replyCap = Math.min(
+					initialCap ?? generationReserveTokens,
+					generationReserveTokens,
+					Math.floor(contextWindow - estimate.estimatedRequestTokens - estimate.safetyMarginTokens),
+				);
+				if (this.#clmPendingCapNotice) {
+					// Finalize the announcement on the converted request. Its own digits can change
+					// token cost, so lower the cap monotonically until both the notice and reply fit.
+					for (;;) {
+						this.#updateClmCapNotice(context, replyCap);
+						estimate = this.#clmBudget.estimate(inputs);
+						this.#assertClmFits(estimate, request.model, initialCap);
+						const nextCap = Math.min(
+							replyCap,
+							Math.floor(contextWindow - estimate.estimatedRequestTokens - estimate.safetyMarginTokens),
+						);
+						if (nextCap === replyCap) break;
+						replyCap = nextCap;
+					}
+					const detail = this.#clmPendingCapNotice.detail;
+					// Activity first: the transcript claims the notice text it renders as a chip.
+					if (detail?.kind === "urgent") {
+						const notice: ClmPressureNotice = { ...detail, message: this.#clmPendingCapNotice.message, replyCap };
+						// The journaled feedback replays the chip as finally shown.
+						const details = this.#clmPendingCapNotice.notice.details as ClmFeedbackDetails | undefined;
+						if (details) {
+							details.activity = details.activity.map(activity =>
+								activity.type === "notice" && activity.notice === detail
+									? { type: "notice", notice }
+									: activity,
+							);
+						}
+						this.#emitClmActivity({ type: "notice", notice });
+					}
+					this.emitNotice("warning", this.#clmPendingCapNotice.message, "clm");
+					this.#clmPendingCapNotice = undefined;
+				}
+				request.maxTokens = replyCap;
+				this.#clmBudget.capture({ ...inputs, providerContext: context });
+			}),
+		);
 
 		const handoffHost: SessionHandoffHost = {
 			agent: this.agent,
@@ -3510,8 +3715,18 @@ export class AgentSession implements SettingsScope {
 		// toolUse) assistant message and skipping settle-only work.
 		if (event.type === "message_end" && event.message.role === "assistant") {
 			this.#lastAssistantMessage = event.message;
+			this.#clmBudget.settle(event.message);
 			this.#cacheWarmer?.onResponse(event.message);
 			if (this.#deferredTitle && isTitleContextReply(event.message)) this.#advanceDeferredTitle("replied");
+		}
+		// Failed and aborted provider stops skip the healthy-turn hook that owns CLM boundaries, so a
+		// staged draft would otherwise survive into an unrelated later boundary and commit there.
+		if (
+			event.type === "turn_end" &&
+			event.message.role === "assistant" &&
+			(event.message.stopReason === "error" || event.message.stopReason === "aborted")
+		) {
+			this.#clm.discard("turn aborted or failed");
 		}
 		// Expected internal transitions stamp a structural suppression flag on the
 		// persisted message BEFORE the obfuscator's display-side copy below, so the
@@ -5060,6 +5275,26 @@ export class AgentSession implements SettingsScope {
 		return () => this.#sessionChangeCallbacks.delete(callback);
 	}
 
+	/** Transcript-only CLM receipts and pressure notices; never part of the RPC/print event stream. */
+	subscribeClmActivity(listener: (activity: ClmActivity) => void): () => void {
+		this.#clmActivityListeners.push(listener);
+		return () => {
+			const index = this.#clmActivityListeners.indexOf(listener);
+			if (index !== -1) this.#clmActivityListeners.splice(index, 1);
+		};
+	}
+
+	#emitClmActivity(activity: ClmActivity): void {
+		const listeners = [...this.#clmActivityListeners];
+		for (const listener of listeners) {
+			try {
+				listener(activity);
+			} catch (err) {
+				logger.error("CLM activity listener threw", { err });
+			}
+		}
+	}
+
 	subscribeCommandMetadataChanged(listener: CommandMetadataChangedListener): () => void {
 		this.#commandMetadataChangedListeners.push(listener);
 		return () => {
@@ -5477,6 +5712,7 @@ export class AgentSession implements SettingsScope {
 		this.#releasePowerAssertion();
 		await cleanupEmptyMoveSession(this.sessionManager, this.#movedFromEmptySessionFile);
 		this.#movedFromEmptySessionFile = undefined;
+		this.#clm.discard("session disposed");
 		this.#closeAllProviderSessions("dispose");
 		this.#maintenance.cancelSpeculation();
 		this.setHindsightSessionState(undefined);
@@ -6210,6 +6446,327 @@ export class AgentSession implements SettingsScope {
 	get compactionSpeculation(): "idle" | "running" | "armed" {
 		return this.#maintenance.speculationState;
 	}
+	/** Inspect the effective context; tools receive this capability only from their owning session. */
+	getClmContext(): ClmContextAccess {
+		return this.#clm;
+	}
+
+	/** Read-only document, history, and archive views for the `/context` inspector. */
+	getClmInspector(): ClmContextInspector {
+		return this.#clm;
+	}
+
+	/** Restore editable historical state as a new durable revision while retaining the current user turn. */
+	restoreClmContext(revision: string): Promise<string> {
+		return this.#clm.restore(revision);
+	}
+
+	#clmBudgetInputs(
+		messages: readonly AgentMessage[],
+		providerContext?: Context,
+		model = this.model,
+		allowAnchor = providerContext !== undefined || messages === this.agent.state.messages,
+	): ClmBudgetInputs {
+		const branch = this.sessionManager.getBranch();
+		const boundary = branch.findLast(
+			entry => entry.type === "context_projection" || entry.type === "compaction" || entry.type === "reset_boundary",
+		);
+		// CLM's own projections keep the measured ratio; replaced conversations do not.
+		const conversation =
+			boundary?.type === "context_projection"
+				? branch.findLast(entry => entry.type === "compaction" || entry.type === "reset_boundary")
+				: boundary;
+		return {
+			identity: JSON.stringify([
+				this.sessionManager.getSessionId(),
+				this.#sessionGeneration,
+				boundary?.id,
+				this.#stats.compactionEpoch,
+				model?.provider,
+				model?.id,
+				model?.api,
+				model?.baseUrl,
+				model ? this.#modelRegistry.getProviderBaseUrl?.(model.provider) : undefined,
+			]),
+			provider: model?.provider ?? "",
+			model: model?.id ?? "",
+			ratioScope: JSON.stringify([
+				this.sessionManager.getSessionId(),
+				this.#sessionGeneration,
+				conversation?.id,
+				model?.api,
+				model?.baseUrl,
+				model ? this.#modelRegistry.getProviderBaseUrl?.(model.provider) : undefined,
+			]),
+			messages,
+			systemPrompt: this.agent.state.systemPrompt,
+			toolsKey: JSON.stringify([
+				this.agent.pruneToolDescriptions,
+				this.agent.state.tools.map(tool => ({
+					name: tool.name,
+					description: tool.description,
+					parameters: toolWireSchema(tool),
+				})),
+			]),
+			nonMessageTokens: computeNonMessageTokens(this, this.#clmBudget.tokenizer(), this.settings.revision),
+			providerContext,
+			allowAnchor,
+			unsafePayload: !this.#providerPayloadIsUnmodified(),
+		};
+	}
+
+	#isClmEnabled(): boolean {
+		const config = cfgCompaction.get(this.settings);
+		if (config.experimentalClm && config.experimentalContextManagement) {
+			throw new Error(
+				"CLM activation refused: compaction.experimentalClm and compaction.experimentalContextManagement are mutually exclusive. Disable one explicitly.",
+			);
+		}
+		return config.experimentalClm === true;
+	}
+
+	#notifyClm(
+		level: "info" | "warning",
+		message: string,
+		generation = this.#promptGeneration,
+		finalizeReplyCap = false,
+		detail?: ClmPressureNotice,
+		receipt?: ClmReceipt,
+	): void {
+		if (!finalizeReplyCap) {
+			if (detail) this.#emitClmActivity({ type: "notice", notice: detail });
+			this.emitNotice(level, message, "clm");
+		}
+		this.#clmFeedback.push({
+			owner: this.sessionManager.getSessionId(),
+			generation,
+			text: message.slice(0, 1024),
+			finalizeReplyCap,
+			activity: detail ? { type: "notice", notice: detail } : receipt ? { type: "receipt", receipt } : undefined,
+		});
+		if (this.#clmFeedback.length > CLM_FEEDBACK_LIMIT) this.#clmFeedback.shift();
+	}
+	#updateClmCapNotice(context: Context, replyCap: number): void {
+		const pending = this.#clmPendingCapNotice;
+		if (!pending || typeof pending.notice.content !== "string") return;
+		const before = pending.notice.content;
+		const message = pending.message.replace(
+			/Only \d+ of (\d+) reply tokens still fit/,
+			`Only ${replyCap} of $1 reply tokens still fit`,
+		);
+		const after = before.replace(pending.message, message);
+		if (after === before) return;
+		pending.message = message;
+		pending.notice.content = after;
+		invalidateMessageCache(pending.notice);
+		for (const providerMessage of context.messages) {
+			if (
+				providerMessage.role === "assistant" ||
+				providerMessage.timestamp !== pending.notice.timestamp ||
+				providerMessage.attribution !== "agent"
+			)
+				continue;
+			let changed = false;
+			if (typeof providerMessage.content === "string") {
+				if (!providerMessage.content.includes(before)) continue;
+				providerMessage.content = providerMessage.content.replace(before, after);
+				changed = true;
+			} else {
+				for (const block of providerMessage.content) {
+					if (block.type !== "text" || !block.text.includes(before)) continue;
+					block.text = block.text.replace(before, after);
+					changed = true;
+				}
+			}
+			if (changed) invalidateMessageCache(providerMessage);
+		}
+	}
+
+	/**
+	 * CLM capacity lines. The hard capacity reserves only this request's output cap (never a compaction
+	 * reserve); the configured compaction threshold is the soft line where the model must edit context.
+	 */
+	#clmCapacity(estimate: ClmBudgetEstimate, model = this.model, maxTokens?: number): ClmCapacity {
+		const contextWindow = model?.contextWindow ?? 0;
+		const requested = maxTokens ?? model?.maxTokens ?? 0;
+		// A catalog output limit at or above the window would leave no input room; providers fit the
+		// actual cap to the remaining room, so the reserve never claims more than half the window.
+		const generationReserveTokens = Math.min(
+			requested > 0 ? requested : CLM_MIN_REPLY_TOKENS,
+			Math.floor(contextWindow / 2),
+		);
+		const capacityTokens = contextWindow - generationReserveTokens;
+		return {
+			contextWindow,
+			generationReserveTokens,
+			minimumReplyTokens: Math.min(generationReserveTokens, CLM_MIN_REPLY_TOKENS),
+			capacityTokens,
+			softLimitTokens:
+				contextWindow > 0 ? resolveThresholdTokens(contextWindow, cfgCompaction.get(this.settings)) : 0,
+			remainingTokens: capacityTokens - estimate.estimatedRequestTokens - estimate.safetyMarginTokens,
+		};
+	}
+
+	/** The only refusal: not even a minimal reply fits beside the request. */
+	#assertClmFits(estimate: ClmBudgetEstimate, model = this.model, maxTokens?: number): void {
+		const { contextWindow, minimumReplyTokens } = this.#clmCapacity(estimate, model, maxTokens);
+		if (contextWindow <= 0) throw new Error("CLM requires a model with a known context window");
+		if (estimate.estimatedRequestTokens + estimate.safetyMarginTokens + minimumReplyTokens > contextWindow) {
+			throw new ClmCapacityError(
+				`estimated ${estimate.estimatedRequestTokens} input tokens + ${estimate.safetyMarginTokens} safety margin + ${minimumReplyTokens} minimum reply > ${contextWindow} window. Use /context to inspect, /compact for explicit readable rescue, or select a larger-window model. No tools were rerun.`,
+			);
+		}
+	}
+
+	/** Admits each provider request: CLM capacity first, then queued host feedback for this owner/generation. */
+	async #admitClmRequest(
+		messages: AgentMessage[],
+		signal: AbortSignal | undefined,
+	): Promise<AgentRequestAdmission | undefined> {
+		this.#clmPendingCapNotice = undefined;
+		const maxTokens = this.#clm.isEnabled() ? await this.#admitClmCapacity(messages, signal) : undefined;
+		const owner = this.sessionManager.getSessionId();
+		const feedback = this.#clmFeedback.filter(
+			entry => entry.owner === owner && entry.generation === this.#promptGeneration,
+		);
+		this.#clmFeedback = [];
+		if (feedback.length === 0) return maxTokens === undefined ? undefined : { maxTokens };
+		const activity = feedback.flatMap(entry => (entry.activity ? [entry.activity] : []));
+		const notice: CustomMessage<ClmFeedbackDetails | undefined> = {
+			role: "custom",
+			customType: CLM_FEEDBACK_MESSAGE_TYPE,
+			content: prompt.render(clmFeedbackNoticeTemplate, { text: feedback.map(entry => entry.text).join("\n") }),
+			display: false,
+			details: activity.length > 0 ? { activity } : undefined,
+			attribution: "agent",
+			timestamp: Date.now(),
+		};
+		const capFeedback = feedback.findLast(entry => entry.finalizeReplyCap);
+		if (capFeedback) {
+			this.#clmPendingCapNotice = {
+				notice,
+				message: capFeedback.text,
+				detail: capFeedback.activity?.type === "notice" ? capFeedback.activity.notice : undefined,
+			};
+		}
+		return { messages: [notice], maxTokens };
+	}
+
+	/**
+	 * Early pressure, the soft-limit urgency, and the hard line for the request about to be sent.
+	 * Returns a lowered output cap when the configured one no longer fits beside the request.
+	 */
+	async #admitClmCapacity(messages: AgentMessage[], signal: AbortSignal | undefined): Promise<number | undefined> {
+		const model = this.model;
+		let estimate = this.#clmBudget.estimate(this.#clmBudgetInputs(messages, undefined, model, true));
+		const capacity = this.#clmCapacity(estimate, model);
+		const { contextWindow, softLimitTokens, minimumReplyTokens, generationReserveTokens } = capacity;
+		if (contextWindow <= 0) throw new Error("CLM requires a model with a known context window");
+		let tokens = estimate.estimatedRequestTokens;
+		if (this.#clmLastEstimate !== undefined && tokens > this.#clmLastEstimate) {
+			this.#clmRecentGrowth.push(tokens - this.#clmLastEstimate);
+			if (this.#clmRecentGrowth.length > CLM_GROWTH_WINDOW) this.#clmRecentGrowth.shift();
+		}
+		this.#clmLastEstimate = tokens;
+		const revisionKey = `${this.sessionManager.getSessionId()}:${this.sessionManager.getLatestContextProjection()?.id ?? "root"}:${model?.id}`;
+		// The early warning keeps the pre-CLM 80% line and also leaves room for one more tool batch as large as any recent one.
+		const batchAllowance = Math.max(contextWindow * 0.2, 2 * Math.max(0, ...this.#clmRecentGrowth));
+		if (
+			tokens + estimate.safetyMarginTokens > softLimitTokens - batchAllowance &&
+			this.#clmPressureRevision !== revisionKey
+		) {
+			this.#clmPressureRevision = revisionKey;
+			const message = `CLM pressure: request ≈${tokens} tokens; the configured context-management limit is ${softLimitTokens} and requests are refused near ${contextWindow - minimumReplyTokens}. Before your next large tool call, read context://self, delete completed tool output you no longer need, and write it back.`;
+			this.#notifyClm("warning", message, this.#promptGeneration, false, {
+				kind: "pressure",
+				tokens,
+				softLimitTokens,
+				message,
+			});
+		}
+		let room = contextWindow - tokens - estimate.safetyMarginTokens;
+		if (room < minimumReplyTokens && (await this.#spillUnseenToolResults(messages, signal, model))) {
+			estimate = this.#clmBudget.estimate(this.#clmBudgetInputs(messages, undefined, model, true));
+			tokens = estimate.estimatedRequestTokens;
+			room = contextWindow - estimate.estimatedRequestTokens - estimate.safetyMarginTokens;
+		}
+		this.#assertClmFits(estimate, model);
+		const maxTokens = room < generationReserveTokens ? room : undefined;
+		const urgentRevision = this.sessionManager.getLatestContextProjection()?.id ?? "root";
+		const urgentKey = `${this.sessionManager.getSessionId()}:${urgentRevision}:${model?.id}:${this.#promptSequence}`;
+		if ((tokens > softLimitTokens || maxTokens !== undefined) && this.#clmUrgentKey !== urgentKey) {
+			this.#clmUrgentKey = urgentKey;
+			const replyCap =
+				maxTokens === undefined
+					? ""
+					: ` Only ${maxTokens} of ${generationReserveTokens} reply tokens still fit, so this reply is capped.`;
+			const message = `CLM urgent: request ≈${tokens} tokens ${tokens > softLimitTokens ? `is past the configured context-management limit (${softLimitTokens})` : "leaves insufficient room for the configured reply"}.${replyCap} Edit context via context://self before continuing other work: delete completed tool output and stale history, keep what the task still needs.`;
+			this.#notifyClm("warning", message, this.#promptGeneration, maxTokens !== undefined, {
+				kind: "urgent",
+				tokens,
+				softLimitTokens,
+				replyCap: maxTokens,
+				message,
+			});
+		}
+		return maxTokens;
+	}
+
+	/**
+	 * Over-capacity rescue that never reruns tools: moves tool results the model has not seen yet
+	 * (after its last response), newest first, to session artifacts with a pointer and preview.
+	 * Commits every rescued result, even if the protected input still cannot fit.
+	 */
+	async #spillUnseenToolResults(
+		messages: AgentMessage[],
+		signal: AbortSignal | undefined,
+		model: Model | undefined,
+	): Promise<boolean> {
+		const live = this.agent.state.messages;
+		const unseen = live
+			.slice(live.findLastIndex(message => message.role === "assistant") + 1)
+			.filter(message => message.role === "toolResult");
+		const replacements = new Map<AgentMessage, AgentMessage>();
+		const artifacts: string[] = [];
+		for (const message of unseen.reverse()) {
+			const spilled = await spillToolResultToArtifact(
+				{ content: message.content, details: message.details },
+				message.toolName,
+				this.sessionManager,
+				CLM_SPILL_PREVIEW,
+			);
+			const meta: OutputMeta | undefined = spilled.details?.meta;
+			const artifactId = meta?.truncation?.artifactId;
+			if (!artifactId) continue;
+			replacements.set(message, {
+				...message,
+				content: appendOutputNotice(spilled.content, meta),
+				details: spilled.details,
+			});
+			artifacts.push(`artifact://${artifactId} (${message.toolName})`);
+			const candidate = this.#clmBudget.estimate(
+				this.#clmBudgetInputs(
+					messages.map(item => replacements.get(item) ?? item),
+					undefined,
+					model,
+					false,
+				),
+			);
+			const { contextWindow, minimumReplyTokens } = this.#clmCapacity(candidate, model);
+			if (candidate.estimatedRequestTokens + candidate.safetyMarginTokens + minimumReplyTokens <= contextWindow)
+				break;
+		}
+		if (replacements.size === 0) return false;
+		await this.#clm.spillToolOutputs(live, replacements, signal, messages);
+		const message = `CLM moved ${artifacts.length} unseen tool result(s) to artifacts to reduce this request: ${artifacts.join(", ")}. Each keeps a preview; read the rest with a line range only as needed. Edit context via context://self now.`;
+		this.#notifyClm("warning", message, this.#promptGeneration, false, {
+			kind: "spill",
+			artifacts: artifacts.length,
+			message,
+		});
+		return true;
+	}
+
 	/** Strip image content from the current branch and persist the rewrite. */
 	dropImages(): Promise<{ removed: number }> {
 		return this.#maintenance.dropImages();
@@ -7697,6 +8254,8 @@ export class AgentSession implements SettingsScope {
 			if (planReferenceMessage) {
 				this.#planReferenceSent = true;
 			}
+			// The run's own request stays protected from CLM edits, whatever its attribution (subagent task prompts).
+			if (message.role === "user" && message.synthetic !== true) this.#clmRunInitiator = message;
 			try {
 				await this.#recovery.promptAgentWithIdleRetry(messages, agentPromptOptions);
 			} finally {
@@ -9177,6 +9736,7 @@ export class AgentSession implements SettingsScope {
 			for (const controller of this.#imageDescriptionAbortControllers) controller.abort(options?.reason);
 			this.abortRetry();
 			this.#promptGeneration++;
+			this.#clm.discard("session interrupted");
 			// Cancel any awaited pre-dispatch setup (e.g. Hindsight auto-recall) so the
 			// admitted submission unwinds now instead of at the recall timeout (#12668).
 			this.#promptSetupAbortController?.abort(options?.reason);
@@ -11041,6 +11601,10 @@ export class AgentSession implements SettingsScope {
 			skipConversationRestore = result?.skipConversationRestore ?? false;
 		}
 
+		// The running loop answers the history being left from its own copy of the context;
+		// left running, its reply would land in the branched session.
+		if (this.isStreaming) await this.abort();
+
 		// Clear pending messages (bound to old session state)
 		this.#pendingNextTurnMessages = [];
 		this.#scheduledHiddenNextTurnGeneration = undefined;
@@ -11385,11 +11949,21 @@ export class AgentSession implements SettingsScope {
 			targetEntry.parentId !== null
 				? targetEntry.parentId
 				: targetId;
-		const { entries: entriesToSummarize, commonAncestorId } = collectEntriesForBranchSummary(
+		const { entries: historicalSummaryEntries, commonAncestorId } = collectEntriesForBranchSummary(
 			this.sessionManager,
 			oldLeafId,
 			summaryAnchorId,
 		);
+		// A semantic branch summary must not resurrect content discarded by a projection.
+		const entriesToSummarize = this.sessionManager.getLatestContextProjection()
+			? this.agent.state.messages.map((message, index): SessionMessageEntry => ({
+					type: "message",
+					id: `clm-summary-${index}`,
+					parentId: index === 0 ? null : `clm-summary-${index - 1}`,
+					timestamp: new Date(message.timestamp).toISOString(),
+					message,
+				}))
+			: historicalSummaryEntries;
 
 		// Prepare event data
 		const preparation: TreePreparation = {
@@ -11464,6 +12038,11 @@ export class AgentSession implements SettingsScope {
 			summaryText = hookSummary.summary;
 			summaryDetails = hookSummary.details;
 		}
+
+		// The running loop answers the history being left from its own copy of the context;
+		// left running, its reply would land on the new branch after the model read what the
+		// user just took back, and owned-state commits (CLM edits) would compare two histories.
+		if (this.isStreaming) await this.abort();
 
 		// All cancellation/no-op exits are behind us. Invalidate prompt setup
 		// admitted on the abandoned branch before committing any tree changes.
@@ -11741,11 +12320,37 @@ export class AgentSession implements SettingsScope {
 		contextWindow?: number;
 		pendingMessages?: AgentMessage[];
 	}): ContextUsageBreakdown | undefined {
-		return this.#stats.getContextBreakdown(options);
+		const breakdown = this.#stats.getContextBreakdown(options);
+		if (
+			!breakdown ||
+			(!cfgCompactionExperimentalClm.get(this.settings) && !this.sessionManager.getLatestContextProjection())
+		)
+			return breakdown;
+		const messages = options?.pendingMessages?.length
+			? [...this.agent.state.messages, ...options.pendingMessages]
+			: this.agent.state.messages;
+		const budget = this.#clmBudget.estimate({ ...this.#clmBudgetInputs(messages), allowAnchor: true });
+		const nonMessage =
+			breakdown.systemPromptTokens +
+			breakdown.systemToolsTokens +
+			breakdown.systemContextTokens +
+			breakdown.skillsTokens;
+		return {
+			...breakdown,
+			anchored: budget.usageAnchor.valid,
+			usedTokens: budget.estimatedRequestTokens,
+			messagesTokens: Math.max(0, budget.estimatedRequestTokens - nonMessage),
+		};
 	}
 
 	getContextUsage(options?: { contextWindow?: number }): ContextUsage | undefined {
-		return this.#stats.getContextUsage(options);
+		const breakdown = this.getContextBreakdown(options);
+		if (!breakdown) return undefined;
+		return {
+			tokens: breakdown.usedTokens,
+			contextWindow: breakdown.contextWindow,
+			percent: breakdown.contextWindow > 0 ? (breakdown.usedTokens / breakdown.contextWindow) * 100 : 0,
+		};
 	}
 
 	/**

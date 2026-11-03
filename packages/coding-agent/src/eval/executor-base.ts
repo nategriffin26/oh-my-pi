@@ -1,3 +1,4 @@
+import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { logger } from "@oh-my-pi/pi-utils";
 import { Settings } from "../config/settings";
 import { type OutputArtifactError, OutputSink } from "@oh-my-pi/pi-tui/tools/streaming-output";
@@ -74,6 +75,7 @@ export interface KernelExecutorBaseOptions {
 	onStatus?: (event: JsStatusEvent) => void;
 	emitStatus?: (event: JsStatusEvent) => void;
 	toolSession?: ToolSession;
+	toolContext?: AgentToolContext;
 	bridgeSessionId?: string;
 	artifactId?: string;
 	artifactPath?: string;
@@ -500,6 +502,7 @@ export async function executeWithKernelBase<
 		options?.toolSession && options?.bridgeSessionId
 			? registerPyToolBridge(options.bridgeSessionId, runId, {
 					toolSession: options.toolSession,
+					toolContext: options.toolContext,
 					signal: options.signal,
 					shieldedSignal: abortShield.signal,
 					emitStatus,

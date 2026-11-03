@@ -113,13 +113,15 @@ const RANGES_EXPANDED = 3;
 const STRONG = 0.7;
 const PLAUSIBLE = 0.4;
 
-function scoreColor(p: number): ThemeColor {
+/** Theme color of a judge probability: strong, plausible, or weak. */
+export function scoreColor(p: number): ThemeColor {
 	return p >= STRONG ? "success" : p >= PLAUSIBLE ? "warning" : "muted";
 }
 
-function gauge(p: number, theme: Theme): string {
+/** Score bar for a judge probability, `width` cells of the theme's progress glyphs. */
+export function scoreGauge(p: number, theme: Theme, width = GAUGE_WIDTH): string {
 	const color = scoreColor(p);
-	return renderProgressBar(p, GAUGE_WIDTH, {
+	return renderProgressBar(p, width, {
 		style: {
 			filled: theme.symbol("progress.filled"),
 			empty: theme.symbol("progress.empty"),
@@ -140,7 +142,7 @@ function renderHit(hit: FindHit, rangeLimit: number, cwd: string | undefined, th
 	};
 	const coverage = hit.truncated ? `${hit.linesSeen} lines judged, partial` : `${hit.linesSeen} lines judged`;
 	const lines = [
-		`${gauge(hit.contentScore, theme)} ${theme.fg(scoreColor(hit.contentScore), hit.contentScore.toFixed(2))} ${link(theme.fg("accent", hit.rel))} ${theme.fg("dim", coverage)}`,
+		`${scoreGauge(hit.contentScore, theme)} ${theme.fg(scoreColor(hit.contentScore), hit.contentScore.toFixed(2))} ${link(theme.fg("accent", hit.rel))} ${theme.fg("dim", coverage)}`,
 	];
 	const ranges = [...hit.ranges].sort((a, b) => b.p - a.p || a.start - b.start).slice(0, rangeLimit);
 	ranges.forEach((range, index) => {
@@ -153,7 +155,8 @@ function renderHit(hit: FindHit, rangeLimit: number, cwd: string | undefined, th
 	return lines;
 }
 
-function scoreTone(p: number): TspTone {
+/** Native tone of a judge probability, matching {@link scoreColor}. */
+export function scoreTone(p: number): TspTone {
 	return p >= STRONG ? "success" : p >= PLAUSIBLE ? "warning" : "muted";
 }
 

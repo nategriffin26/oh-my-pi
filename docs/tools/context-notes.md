@@ -15,6 +15,7 @@
 - The setting defaults to `false`. Enable **Notes-backed context windows (experimental)** under `/settings` → Context → Compaction; ordinary running sessions reconcile the tool immediately. Restricted sessions retain their host-provided tool list.
 - Metadata: `strict = true`, `loadMode = "essential"`. Calls without a `text` property request read approval; calls with that property request write approval.
 - Notes-backed rollover requires all four tools to be active: `context_notes`, `new_context`, `read`, and `grep`.
+- This mode is mutually exclusive with `compaction.experimentalClm`; CLM uses `context://self` instead of a separate notebook/rollover strategy.
 
 ## Inputs
 

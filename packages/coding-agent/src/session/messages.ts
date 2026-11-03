@@ -49,7 +49,7 @@ import {
 	invalidateMessageCache,
 	registerMessageCacheInvalidator,
 } from "@oh-my-pi/pi-agent-core/compaction/message-cache";
-import { convertMessageToLlm } from "@oh-my-pi/pi-agent-core/compaction/messages";
+import { clmRewriteCarry, convertMessageToLlm } from "@oh-my-pi/pi-agent-core/compaction/messages";
 import type { AssistantMessage, ImageContent, Message, TextContent, UserMessage } from "@oh-my-pi/pi-ai";
 import { copyPerCallContextMessage } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { isRecord, logger, prompt } from "@oh-my-pi/pi-utils";
@@ -57,6 +57,11 @@ import { COLLAB_PROMPT_MESSAGE_TYPE } from "@oh-my-pi/pi-wire";
 import userInterjectionTemplate from "../prompts/steering/user-interjection.md" with { type: "text" };
 import { formatTitleConversationContext, type TitleConversationTurn } from "../tiny/message-preproc";
 import { stripXdUrlPrefix } from "@oh-my-pi/pi-tui/tools/xd-url";
+import {
+	CLM_HANDOFF_MESSAGE_TYPE,
+	CLM_OUT_OF_CONTEXT_INDEX_MESSAGE_TYPE,
+	CLM_PARENT_MANIFEST_MESSAGE_TYPE,
+} from "./clm-state";
 
 export {
 	type BranchSummaryMessage,
@@ -963,6 +968,7 @@ function convertImageBearingCustomMessage(message: CustomMessage | HookMessage):
  */
 interface ConvertMemoEntry {
 	interruptedNext: boolean;
+	rewriteAt: number | undefined;
 	fragment: Message[];
 }
 const convertCache = new WeakMap<AgentMessage, ConvertMemoEntry>();
@@ -1004,8 +1010,9 @@ registerMessageCacheInvalidator(message => {
 });
 
 /** Convert one message to its LLM fragment. `interruptedNext` is true only for an
- *  assistant turn immediately followed by its interrupted-thinking marker. */
-function convertOne(m: AgentMessage, interruptedNext: boolean): Message[] {
+ *  assistant turn immediately followed by its interrupted-thinking marker;
+ *  `rewriteAt` is the CLM rewrite-marker time `clmRewriteCarry` assigns here. */
+function convertOne(m: AgentMessage, interruptedNext: boolean, rewriteAt: number | undefined): Message[] {
 	switch (m.role) {
 		case "bashExecution":
 			if (m.excludeFromContext) {
@@ -1072,6 +1079,22 @@ function convertOne(m: AgentMessage, interruptedNext: boolean): Message[] {
 		}
 		case "custom": {
 			if (!isCustomMessageContent(m.content)) return [];
+			if (
+				m.customType === CLM_HANDOFF_MESSAGE_TYPE ||
+				m.customType === CLM_PARENT_MANIFEST_MESSAGE_TYPE ||
+				m.customType === CLM_OUT_OF_CONTEXT_INDEX_MESSAGE_TYPE
+			) {
+				// Persist raw provenance, but lower historical bytes through the escaped data envelope.
+				const content =
+					typeof m.content === "string"
+						? m.content
+						: m.content
+								.filter(part => part.type === "text")
+								.map(part => part.text)
+								.join("\n");
+				const converted = convertMessageToLlm({ role: "clmNote", content, timestamp: m.timestamp });
+				return converted ? [converted] : [];
+			}
 			if (isSteeringUserMessage(m)) {
 				const converted = convertMessageToLlm(wrapSteeringUserMessage(m));
 				return converted ? [converted] : [];
@@ -1114,12 +1137,13 @@ function convertOne(m: AgentMessage, interruptedNext: boolean): Message[] {
 		}
 		case "branchSummary":
 		case "compactionSummary":
+		case "clmNote":
 		case "user":
 		case "developer": {
 			// Core roles share one transformer with agent-core —
 			// duplicating them here is how snapcompact frames once
 			// silently fell off the provider request.
-			const converted = convertMessageToLlm(m);
+			const converted = convertMessageToLlm(m, rewriteAt);
 			return converted ? [converted] : [];
 		}
 		case "toolResult": {
@@ -1136,13 +1160,15 @@ function convertOne(m: AgentMessage, interruptedNext: boolean): Message[] {
 }
 
 /** Cached per-message conversion. Reuses the stored fragment while identity and
- *  `interruptedNext` neighbor state hold; recomputes on a neighbor flip. */
-function convertOneCached(m: AgentMessage, interruptedNext: boolean): Message[] {
+ *  neighbor state (`interruptedNext`, CLM `rewriteAt`) hold; recomputes on a neighbor flip. */
+function convertOneCached(m: AgentMessage, interruptedNext: boolean, rewriteAt: number | undefined): Message[] {
 	const cached = convertCache.get(m);
-	if (cached !== undefined && cached.interruptedNext === interruptedNext) return cached.fragment;
-	const fragment = convertOne(m, interruptedNext);
+	if (cached !== undefined && cached.interruptedNext === interruptedNext && cached.rewriteAt === rewriteAt) {
+		return cached.fragment;
+	}
+	const fragment = convertOne(m, interruptedNext, rewriteAt);
 	for (const message of fragment) copyPerCallContextMessage(message, m);
-	convertCache.set(m, { interruptedNext, fragment });
+	convertCache.set(m, { interruptedNext, rewriteAt, fragment });
 	return fragment;
 }
 
@@ -1204,7 +1230,7 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 		if (i === len - 1) prefixOutputLen = out.length;
 		const m = messages[i];
 		const interruptedNext = m.role === "assistant" && followedByInterruptedThinking(messages, i);
-		const fragment = convertOneCached(m, interruptedNext);
+		const fragment = convertOneCached(m, interruptedNext, clmRewriteCarry(messages, i));
 		for (const msg of fragment) out.push(msg);
 	}
 	if (len === 0) prefixOutputLen = 0;

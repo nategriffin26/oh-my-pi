@@ -1913,6 +1913,16 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			// Compaction
 			// =================================================================
 
+			case "get_clm_context": {
+				const text = await session.getClmContext().read(command.target);
+				return success(id, "get_clm_context", { text });
+			}
+
+			case "restore_clm_context": {
+				const text = await session.restoreClmContext(command.revision);
+				return success(id, "restore_clm_context", { text });
+			}
+
 			case "compact": {
 				const result = await session.compact(command.customInstructions);
 				return success(id, "compact", result);

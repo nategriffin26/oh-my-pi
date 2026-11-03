@@ -89,13 +89,35 @@ export interface AgentPreModelCallStop {
 export type AgentPreModelCallResult = AgentPreModelCallStop | undefined;
 
 /**
- * A pre-model-call gate. Return {@link AgentPreModelCallStop} to refuse the
- * request, or nothing to proceed; the signal aborts with the run.
+ * A pre-model-call gate over the prepared provider context. The request snapshot
+ * supplies the exact raw message prefix, selected model, and any output cap the
+ * request admission lowered for this call, before deferred message events update
+ * agent state. A gate may lower `request.maxTokens` again to account for the
+ * prepared context; the loop dispatches that final cap. Return a stop result to refuse dispatch.
  */
 export type AgentBeforeModelCall = (
 	context: Context,
-	signal?: AbortSignal,
+	signal: AbortSignal | undefined,
+	request: { model: Model; messages: readonly AgentMessage[]; maxTokens?: number },
 ) => AgentPreModelCallResult | void | Promise<AgentPreModelCallResult | void>;
+
+/** Host decision for the next provider request, resolved before provider conversion. */
+export interface AgentRequestAdmission {
+	/** Host messages that ride with this request, emitted and persisted like other turn input. */
+	messages?: AgentMessage[];
+	/** Output cap for this request only; lower than the configured `maxTokens`. */
+	maxTokens?: number;
+}
+
+/**
+ * Admission over the complete raw request (`messages` already includes queued
+ * input). Runs once per logical turn, so returned messages are never duplicated
+ * by in-turn re-samples. Throw to fail the turn before dispatch.
+ */
+export type AgentRequestAdmissionHook = (
+	messages: AgentMessage[],
+	signal: AbortSignal | undefined,
+) => AgentRequestAdmission | undefined | Promise<AgentRequestAdmission | undefined>;
 
 /**
  * A soft tool requirement: the host wants `toolName` called before the loop
@@ -375,6 +397,9 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * provider-bound context.
 	 */
 	syncContextBeforeModelCall?: (context: AgentContext, signal?: AbortSignal) => void | Promise<void>;
+
+	/** Admits the next provider request after context sync; see {@link AgentRequestAdmissionHook}. */
+	admitRequest?: AgentRequestAdmissionHook;
 
 	/**
 	 * Asked after the complete provider context has been built, including

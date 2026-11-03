@@ -6,11 +6,12 @@ import type {
 	TextContent,
 	ToolResultMessage,
 } from "@oh-my-pi/pi-ai";
-import { prompt } from "@oh-my-pi/pi-utils";
+import { escapeXmlText, prompt } from "@oh-my-pi/pi-utils";
 import type { AgentMessage } from "../types";
 import branchSummaryContextPrompt from "./prompts/branch-summary-context.md" with { type: "text" };
 import compactionSummaryContextPrompt from "./prompts/compaction-summary-context.md" with { type: "text" };
 import handoffSummaryContextPrompt from "./prompts/handoff-summary-context.md" with { type: "text" };
+import clmNoteContextPrompt from "./prompts/clm-note-context.md" with { type: "text" };
 
 const COMPACTION_SUMMARY_TEMPLATE = compactionSummaryContextPrompt;
 const HANDOFF_SUMMARY_TEMPLATE = handoffSummaryContextPrompt;
@@ -37,6 +38,52 @@ export interface HookMessage<T = unknown> {
 	/** Who initiated this message for billing/attribution semantics. */
 	attribution?: MessageAttribution;
 	timestamp: number;
+}
+
+/** Model-authored historical data; never developer authority. */
+export interface ClmNoteMessage {
+	role: "clmNote";
+	/** Raw model-authored text; empty only for a host rewrite marker carrying `historyRewriteAt`. */
+	content: string;
+	historyRewriteAt?: number;
+	timestamp: number;
+}
+
+/** Host-written CLM history-rewrite marker: no model text, only the rewrite time. */
+export function isClmRewriteMarker(message: AgentMessage | undefined): message is ClmNoteMessage & {
+	historyRewriteAt: number;
+} {
+	return message?.role === "clmNote" && message.content === "" && message.historyRewriteAt !== undefined;
+}
+
+/**
+ * Rewrite time an empty CLM marker run hands to `messages[index]` during array conversion.
+ *
+ * Markers never send their own boilerplate: a run of consecutive markers folds its max
+ * `historyRewriteAt` onto the next message when that lowers to a user message, so provider
+ * bound-thinking invalidation and usage-anchor staleness still start at the marker position.
+ * Only when the run is followed by anything else (e.g. an assistant whose bound thinking the
+ * rewrite invalidates) does its last marker return the time so it is sent as a minimal carrier.
+ * A trailing run has nothing after it to invalidate and emits nothing.
+ */
+export function clmRewriteCarry(messages: readonly AgentMessage[], index: number): number | undefined {
+	const message = messages[index];
+	let run = index - 1;
+	if (isClmRewriteMarker(message)) {
+		const next = messages[index + 1];
+		// A later marker of the run, or the user/note message after it, carries the time.
+		if (next === undefined || next.role === "clmNote" || next.role === "user") return undefined;
+		run = index;
+	} else if (message.role !== "user" && message.role !== "clmNote") {
+		return undefined;
+	}
+	let rewriteAt: number | undefined;
+	for (let i = run; i >= 0; i--) {
+		const marker = messages[i];
+		if (!isClmRewriteMarker(marker)) break;
+		rewriteAt = Math.max(rewriteAt ?? marker.historyRewriteAt, marker.historyRewriteAt);
+	}
+	return rewriteAt;
 }
 
 export interface BranchSummaryMessage {
@@ -74,13 +121,19 @@ export interface CompactionSummaryMessage {
 	timestamp: number;
 }
 
-export type CoreCompactionMessage = CustomMessage | HookMessage | BranchSummaryMessage | CompactionSummaryMessage;
+export type CoreCompactionMessage =
+	| CustomMessage
+	| HookMessage
+	| BranchSummaryMessage
+	| CompactionSummaryMessage
+	| ClmNoteMessage;
 
 declare module "../types" {
 	interface CustomAgentMessages {
 		custom: CustomMessage;
 		hookMessage: HookMessage;
 		branchSummary: BranchSummaryMessage;
+		clmNote: ClmNoteMessage;
 		compactionSummary: CompactionSummaryMessage;
 	}
 }
@@ -196,6 +249,7 @@ function isCoreCompactionMessage(message: AgentMessage): message is AgentMessage
 		message.role === "custom" ||
 		message.role === "hookMessage" ||
 		message.role === "branchSummary" ||
+		message.role === "clmNote" ||
 		message.role === "compactionSummary"
 	);
 }
@@ -209,10 +263,40 @@ function isCoreCompactionMessage(message: AgentMessage): message is AgentMessage
  * with their own app messages (e.g. the coding agent) handle their custom
  * roles and delegate every core role here — duplicating these cases is how
  * snapcompact frames once silently fell off the provider request.
+ *
+ * `rewriteAt` is the CLM marker time {@link clmRewriteCarry} assigns to this
+ * position; without it an empty CLM rewrite marker emits nothing.
  */
-export function convertMessageToLlm(message: AgentMessage): Message | undefined {
+export function convertMessageToLlm(message: AgentMessage, rewriteAt?: number): Message | undefined {
 	if (isCoreCompactionMessage(message)) {
 		switch (message.role) {
+			case "clmNote":
+				if (isClmRewriteMarker(message)) {
+					if (rewriteAt === undefined) return undefined;
+					return {
+						role: "user",
+						content: [{ type: "text", text: "[CLM: earlier context was rewritten here.]" }],
+						attribution: "agent",
+						historyRewriteAt: rewriteAt,
+						timestamp: message.timestamp,
+					};
+				}
+				return {
+					role: "user",
+					// Escaped so model-authored text cannot close the host trust envelope; persisted bytes stay raw.
+					content: [
+						{
+							type: "text",
+							text: prompt.render(clmNoteContextPrompt, { content: escapeXmlText(message.content) }),
+						},
+					],
+					attribution: "agent",
+					historyRewriteAt:
+						rewriteAt === undefined
+							? message.historyRewriteAt
+							: Math.max(rewriteAt, message.historyRewriteAt ?? rewriteAt),
+					timestamp: message.timestamp,
+				};
 			case "custom":
 			case "hookMessage": {
 				const content =
@@ -265,7 +349,13 @@ export function convertMessageToLlm(message: AgentMessage): Message | undefined 
 
 	switch (message.role) {
 		case "user":
-			return { ...message, attribution: message.attribution ?? "user" };
+			return rewriteAt === undefined
+				? { ...message, attribution: message.attribution ?? "user" }
+				: {
+						...message,
+						attribution: message.attribution ?? "user",
+						historyRewriteAt: Math.max(rewriteAt, message.historyRewriteAt ?? rewriteAt),
+					};
 		case "developer":
 			return { ...message, attribution: message.attribution ?? "agent" };
 		case "assistant":
@@ -289,5 +379,7 @@ export function convertMessageToLlm(message: AgentMessage): Message | undefined 
  * core LLM roles and the compaction messages owned by this package.
  */
 export function defaultConvertToLlm(messages: AgentMessage[]): Message[] {
-	return messages.map(convertMessageToLlm).filter(message => message !== undefined);
+	return messages
+		.map((message, index) => convertMessageToLlm(message, clmRewriteCarry(messages, index)))
+		.filter(message => message !== undefined);
 }

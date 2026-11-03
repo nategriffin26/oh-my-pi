@@ -28,6 +28,12 @@ import { isUserRequestEntry, type TranscriptEntryLike } from "../chat/transcript
 export type SessionTreeEntry = { id: string; parentId: string | null } & (
 	| TranscriptEntryLike
 	| { type: "compaction"; tokensBefore: number }
+	| {
+			type: "context_projection";
+			cause: "edit" | "restore" | "rebase" | "compact" | "diagnostics" | "spill";
+			tokensBefore: number;
+			tokensAfter: number;
+	  }
 	| { type: "branch_summary"; summary: string }
 	| { type: "model_change"; model: string }
 	| { type: "model_usage"; purpose: string; role?: string; provider: string; model: string }
@@ -477,6 +483,9 @@ class TreeList implements Component {
 				}
 				break;
 			}
+			case "context_projection":
+				parts.push("clm context revision", entry.id, entry.cause);
+				break;
 			case "compaction":
 				parts.push("compaction");
 				break;
@@ -990,6 +999,13 @@ class TreeList implements Component {
 				const content = stripSystemWrapperTags(this.#joinTextContent(entry.content));
 				return [{ t: `[${entry.customType}]: `, s: "customMessageLabel" }, { t: normalize(content) }];
 			}
+			case "context_projection":
+				return [
+					{
+						t: `[context ${sanitizeTreeField(entry.cause)}: ${sanitizeTreeField(entry.id)}, ~${entry.tokensBefore} → ~${entry.tokensAfter} tokens]`,
+						s: "borderAccent",
+					},
+				];
 			case "compaction": {
 				const tokens = Math.round(entry.tokensBefore / 1000);
 				return [{ t: `[compaction: ${tokens}k tokens]`, s: "borderAccent" }];

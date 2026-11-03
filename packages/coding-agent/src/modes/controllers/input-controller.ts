@@ -18,6 +18,7 @@ import { isSettingsInitialized, settings } from "../../config/settings";
 import { InternalUrlRouter, resolveLocalRoot } from "../../internal-urls";
 import { AskDialogComponent } from "@oh-my-pi/pi-tui/overlays/ask-dialog";
 import { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
+import { transcriptBlocks } from "@oh-my-pi/pi-tui/chat/clm-rewritten-history";
 import { extractImagePathFromText } from "@oh-my-pi/pi-tui/prompt/custom-editor";
 import { HistorySearchComponent } from "@oh-my-pi/pi-tui/overlays/history-search";
 import { HookEditorComponent } from "@oh-my-pi/pi-tui/overlays/hook-editor";
@@ -2723,7 +2724,7 @@ export class InputController {
 			this.ctx.toolOutputExpanded = false;
 		}
 
-		for (const child of this.ctx.chatContainer.children) {
+		for (const child of transcriptBlocks(this.ctx.chatContainer.children)) {
 			if (
 				!this.ctx.hideToolActivity &&
 				(child instanceof ToolExecutionComponent || child instanceof ReadToolGroupComponent)
@@ -2768,7 +2769,7 @@ export class InputController {
 		this.ctx.hideThinkingBlock = !this.ctx.hideThinkingBlock;
 		cfgHideThinkingBlock.set(this.ctx.settings, this.ctx.hideThinkingBlock);
 
-		for (const child of this.ctx.chatContainer.children) {
+		for (const child of transcriptBlocks(this.ctx.chatContainer.children)) {
 			if (child instanceof AssistantMessageComponent) {
 				child.setHideThinkingBlock(this.ctx.hideThinkingBlock);
 			}

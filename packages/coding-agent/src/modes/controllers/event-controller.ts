@@ -7,6 +7,7 @@ import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import { extractTextContent } from "../../commit/utils";
 import { settings } from "../../config/settings";
 import { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
+import { transcriptBlocks } from "@oh-my-pi/pi-tui/chat/clm-rewritten-history";
 import { detectCacheInvalidation } from "@oh-my-pi/pi-tui/chat/cache-invalidation-marker";
 import {
 	groupedReadUsageCallIds,
@@ -14,6 +15,8 @@ import {
 	readArgsCollapseIntoGroup,
 	readArgsHaveTarget,
 } from "@oh-my-pi/pi-tui/chat/read-tool-group";
+import { ClmContextEditComponent } from "@oh-my-pi/pi-tui/chat/clm-context-edit";
+import { ClmNoticeComponent } from "@oh-my-pi/pi-tui/chat/clm-notice";
 import { RecapNotice } from "@oh-my-pi/pi-tui/chat/recap-notice";
 import { TodoReminderComponent } from "@oh-my-pi/pi-tui/chat/todo-reminder";
 import { isNativeRendering } from "@oh-my-pi/pi-tui/native/state";
@@ -68,11 +71,27 @@ import {
 	cfgTerminalShowImages,
 	cfgTerminalShowProgress,
 } from "../settings";
-import { cfgCompaction } from "../../session/context-settings";
+import type { ClmActivity } from "../../session/clm-types";
+import { cfgCompaction, cfgCompactionClmShowContextEdits } from "../../session/context-settings";
+import type { ContextProjectionEntry } from "../../session/session-entries";
 import { cfgReadToolResultPreview, cfgToolsApproval, cfgToolsApprovalMode } from "../../tools/settings";
 import { cfgSpeechEnabled, cfgSpeechMode } from "../../tts/settings";
 
 type AgentSessionEventKind = AgentSessionEvent["type"];
+
+/**
+ * Committed CLM revisions that change which scrollback is in the model's context; the transcript
+ * rebuilds so removed history dims and restored history un-dims. Spills replace results in place,
+ * diagnostics are host bookkeeping.
+ */
+const CLM_REBUILD_CAUSES: Record<ContextProjectionEntry["cause"], boolean> = {
+	edit: true,
+	restore: true,
+	rebase: true,
+	compact: true,
+	diagnostics: false,
+	spill: false,
+};
 
 const IRC_MESSAGE_VISIBLE_TTL_MS = 10_000;
 /**
@@ -238,6 +257,12 @@ export class EventController {
 	// Insertion-ordered IRC cards not yet retired; values are the transcript
 	// components each card contributed (see #retireIrcCard for the guard).
 	#liveIrcCards = new Map<string, Component[]>();
+	// CLM notice texts the transcript renders from structured activity instead; the matching
+	// plain `notice` event (always emitted right after the activity) is skipped once.
+	#clmClaimedNotices = new Set<string>();
+	// Live staged `✎ Context edit` cards by transaction; a rejection advances its card in place.
+	#clmEditCards = new Map<string, ClmContextEditComponent>();
+	#clmViewGeneration = 0;
 	// Most recent `wait` tool block whose result still had every watched job
 	// running. Kept un-finalized (live) so the next `wait` call displaces it —
 	// one persistent poll instead of a stack of "waiting on N jobs" frames —
@@ -372,7 +397,7 @@ export class EventController {
 				}
 				this.#prevHideThinking = hideThinking;
 				// Propagate visibility to existing rendered messages.
-				for (const child of this.ctx.chatContainer.children) {
+				for (const child of transcriptBlocks(this.ctx.chatContainer.children)) {
 					if (child instanceof AssistantMessageComponent) {
 						child.setHideThinkingBlock(hideThinking);
 					}
@@ -674,7 +699,7 @@ export class EventController {
 		// the listener's first await, preserving the timing the coalescing
 		// tests assert on. `message_update` enqueue is itself synchronous and
 		// needs no serialization.
-		this.ctx.unsubscribe = this.ctx.session.subscribe(async (event: AgentSessionEvent) => {
+		const unsubscribeEvents = this.ctx.session.subscribe(async (event: AgentSessionEvent) => {
 			// Coalesce the cumulative `message_update` deltas of a streaming turn
 			// into at most one handler run per window. `#handleMessageUpdate` is
 			// synchronous, so without this every token re-runs the whole
@@ -693,6 +718,95 @@ export class EventController {
 				await this.handleEvent(event);
 			});
 		});
+		const unsubscribeClm = this.ctx.session.subscribeClmActivity(activity => this.handleClmActivity(activity));
+		this.ctx.unsubscribe = () => {
+			unsubscribeEvents();
+			unsubscribeClm();
+		};
+	}
+
+	/**
+	 * Render CLM activity of the viewed session: pressure chips, `✎ Context edit` cards, and the
+	 * rebuild that dims history a committed revision removed. The plain notice the session emits
+	 * right after is claimed synchronously here, so it does not render twice.
+	 */
+	handleClmActivity(activity: ClmActivity): void {
+		const viewedSession = this.ctx.viewSession;
+		const owner = viewedSession.sessionManager.getSessionId();
+		const generation = this.#clmViewGeneration;
+		const cards = cfgCompactionClmShowContextEdits.get(this.ctx.settings) === "card";
+		if (activity.type === "notice") {
+			this.#clmClaimedNotices.add(activity.notice.message);
+		} else {
+			const receipt = activity.receipt;
+			const claimed = receipt.kind === "committed" ? CLM_REBUILD_CAUSES[receipt.cause] : cards;
+			if (claimed && receipt.message !== undefined) this.#clmClaimedNotices.add(receipt.message);
+		}
+		void this.#runSerialized(async () => {
+			await this.#flushPendingMessageUpdate();
+			if (
+				generation !== this.#clmViewGeneration ||
+				this.ctx.viewSession !== viewedSession ||
+				viewedSession.sessionManager.getSessionId() !== owner
+			)
+				return;
+			this.#renderClmActivity(activity, cards);
+		}).catch(err => {
+			logger.warn("CLM activity render failed", { error: err instanceof Error ? err.message : String(err) });
+		});
+	}
+
+	#renderClmActivity(activity: ClmActivity, cards: boolean): void {
+		if (activity.type === "notice") {
+			const chip = new ClmNoticeComponent(activity.notice);
+			chip.setExpanded(this.ctx.toolOutputExpanded);
+			this.ctx.present(chip);
+			return;
+		}
+		const receipt = activity.receipt;
+		switch (receipt.kind) {
+			case "staged": {
+				if (!cards) return;
+				const card = new ClmContextEditComponent({
+					state: "staged",
+					transactionId: receipt.transactionId,
+					revision: receipt.revision,
+					snapshotId: receipt.snapshotId,
+					removed: receipt.removed,
+					notes: receipt.notes,
+				});
+				card.setExpanded(this.ctx.toolOutputExpanded);
+				this.#clmEditCards.set(receipt.transactionId, card);
+				this.ctx.present(card);
+				return;
+			}
+			case "rejected": {
+				if (!cards) return;
+				const view = { state: "rejected", transactionId: receipt.transactionId, reason: receipt.reason } as const;
+				const staged = this.#clmEditCards.get(receipt.transactionId);
+				this.#clmEditCards.delete(receipt.transactionId);
+				if (staged) {
+					staged.update(view);
+					this.ctx.ui.requestRender();
+					return;
+				}
+				const card = new ClmContextEditComponent(view);
+				card.setExpanded(this.ctx.toolOutputExpanded);
+				this.ctx.present(card);
+				return;
+			}
+			case "committed": {
+				if (!CLM_REBUILD_CAUSES[receipt.cause]) return;
+				// The rebuilt transcript carries the committed card at the revision's position, exactly
+				// as a reload renders it; the staged card it replaces goes with the old frame.
+				this.#clmEditCards.clear();
+				this.ctx.rebuildChatFromMessages({ reuseSettledComponents: true });
+				this.ctx.statusLine.invalidate();
+				// Same pairing as compaction: the rebuild resets the emission ledger, so the old
+				// copy must leave native scrollback or history would print twice.
+				this.ctx.ui.requestRender(true, { clearScrollback: true });
+			}
+		}
 	}
 
 	/**
@@ -805,6 +919,7 @@ export class EventController {
 	 * session's transcript and must not bleed into the new one.
 	 */
 	resetTranscriptAnchors(): void {
+		this.#clmViewGeneration++;
 		if (this.#messageUpdateTimer) {
 			clearTimeout(this.#messageUpdateTimer);
 			this.#messageUpdateTimer = undefined;
@@ -841,6 +956,8 @@ export class EventController {
 		}
 		this.#ircExpiryTimers.clear();
 		this.#liveIrcCards.clear();
+		this.#clmEditCards.clear();
+		this.#clmClaimedNotices.clear();
 		this.#displaceablePollComponent = undefined;
 		this.#displaceableTodoComponent = undefined;
 		this.#lastTtsrNotification = undefined;
@@ -1308,6 +1425,7 @@ export class EventController {
 	}
 
 	async #handleNotice(event: Extract<AgentSessionEvent, { type: "notice" }>): Promise<void> {
+		if (event.source === "clm" && this.#clmClaimedNotices.delete(event.message)) return;
 		const message = event.source ? `${event.source}: ${event.message}` : event.message;
 		if (event.level === "error") {
 			this.ctx.showError(message);
@@ -1551,6 +1669,21 @@ export class EventController {
 				) {
 					this.ctx.setTodos(owner.getTodoPhases());
 				}
+			}
+		}
+		if (
+			event.message.role === "toolResult" &&
+			event.message.toolName !== "wait" &&
+			event.message.toolName !== "todo"
+		) {
+			const asyncState = (event.message.details as { async?: { state?: string } } | undefined)?.async?.state;
+			const component = this.#toolTimelineComponents.get(event.message.toolCallId);
+			if (
+				asyncState !== "running" &&
+				component instanceof ToolExecutionComponent &&
+				component.isTranscriptBlockFinalized()
+			) {
+				this.ctx.transcriptMessageComponents.set(event.message, component);
 			}
 		}
 		if (event.message.role === "user") {

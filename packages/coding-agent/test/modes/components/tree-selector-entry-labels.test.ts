@@ -137,4 +137,37 @@ describe("tree selector entry labels", () => {
 			expect(rows).not.toContain(label);
 		}
 	});
+
+	it("finds and navigates a context revision by ID in the default view", () => {
+		const edit: SessionEntry = {
+			...base("revision-edit", "u1"),
+			type: "context_projection",
+			version: 1,
+			coveredThroughEntryId: "u1",
+			messages: [],
+			rewriteAt: 1,
+			tokensBefore: 4096,
+			tokensAfter: 2048,
+			cause: "edit",
+		};
+		const restore: SessionEntry = {
+			...edit,
+			...base("revision-restore", edit.id),
+			previousRevisionId: edit.id,
+			cause: "restore",
+		};
+		let selected: string | undefined;
+		const selector = new TreeSelectorComponent(
+			[chain([userEntry, edit, restore])],
+			restore.id,
+			40,
+			id => {
+				selected = id;
+			},
+			() => {},
+		);
+		selector.handleInput(edit.id);
+		selector.handleInput("\r");
+		expect(selected).toBe(edit.id);
+	});
 });

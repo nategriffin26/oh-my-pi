@@ -2,6 +2,7 @@ import { isAnthropicServerToolHistoryBlock } from "@oh-my-pi/pi-ai/providers/ant
 import { countNewlines, isRecord } from "@oh-my-pi/pi-utils";
 import {
 	type BlobStore,
+	parseBlobRef,
 	externalizeImageDataSync,
 	externalizeImageDataUrlSync,
 	isBlobRef,
@@ -14,6 +15,16 @@ const TRUNCATION_NOTICE = "\n\n[Session persistence truncated large content]";
 /** Minimum base64 length to externalize to blob store (skip tiny inline images) */
 const BLOB_EXTERNALIZE_THRESHOLD = 1024;
 const TEXT_CONTENT_KEY = "content";
+/** Fields that contribute model-readable archive text, not provider replay or UI state. */
+export const CLM_ARCHIVE_TEXT_FIELDS: Record<string, true> = {
+	content: true,
+	files: true,
+	summary: true,
+	command: true,
+	code: true,
+	output: true,
+	meta: true,
+};
 /** Parent key under which snapcompact persists its base64 PNG frame archive
  *  (`preserveData.snapcompact.frames[]`). Frame objects are image payloads, so
  *  their base64 must externalize to the blob store rather than fall through to
@@ -36,6 +47,16 @@ function truncateString(value: string, maxLength: number): string {
 /** Detect strings damaged by an older persistence pass so loaders can migrate them safely. */
 export function isPersistenceTruncatedString(value: unknown): value is string {
 	return typeof value === "string" && value.endsWith(TRUNCATION_NOTICE);
+}
+
+/**
+ * The prefix a string shares with its persistence-truncated copy, so both compare equal;
+ * `undefined` when persistence keeps the string whole.
+ */
+export function persistenceTruncationKey(value: string): string | undefined {
+	if (value.endsWith(TRUNCATION_NOTICE)) return value.slice(0, -TRUNCATION_NOTICE.length);
+	if (value.length <= MAX_PERSIST_CHARS) return undefined;
+	return truncateString(value, Math.max(0, MAX_PERSIST_CHARS - TRUNCATION_NOTICE.length));
 }
 
 export function isImageBlock(value: unknown): value is { type: "image"; data: string; mimeType?: string } {
@@ -75,7 +96,11 @@ export function isExternalizableImagePosition(
 	key: string | undefined,
 ): value is { data: string; mimeType?: string } {
 	if (!isImageDataPayload(value)) return false;
-	return (key === TEXT_CONTENT_KEY && isImageBlock(value)) || key === "images" || key === SNAPCOMPACT_FRAMES_KEY;
+	return (
+		((key === TEXT_CONTENT_KEY || key === "blocks" || key === "image") && isImageBlock(value)) ||
+		key === "images" ||
+		key === SNAPCOMPACT_FRAMES_KEY
+	);
 }
 
 function shouldExternalizeImagePayload(
@@ -105,7 +130,7 @@ function isNonEmptyString(value: unknown): value is string {
  * synchronous blob-store path (`fs.writeFileSync`), so blob bytes are in the
  * kernel page cache before the JSONL line referencing them is written.
  */
-function truncateForPersistence(obj: unknown, blobStore: BlobStore, key?: string): unknown {
+function truncateForPersistence(obj: unknown, blobStore: BlobStore, key?: string, lossless = false): unknown {
 	if (obj === null || obj === undefined) return obj;
 	if (
 		typeof obj === "object" &&
@@ -180,6 +205,7 @@ function truncateForPersistence(obj: unknown, blobStore: BlobStore, key?: string
 			if (key === "thinkingSignature" || key === "thoughtSignature" || key === "textSignature") {
 				return obj;
 			}
+			if (lossless) return obj;
 			const limit = Math.max(0, MAX_PERSIST_CHARS - TRUNCATION_NOTICE.length);
 			return `${truncateString(obj, limit)}${TRUNCATION_NOTICE}`;
 		}
@@ -192,7 +218,7 @@ function truncateForPersistence(obj: unknown, blobStore: BlobStore, key?: string
 		const result: unknown[] = new Array(obj.length);
 		for (let i = 0; i < obj.length; i++) {
 			const item = obj[i];
-			const newItem = truncateForPersistence(item, blobStore, key);
+			const newItem = truncateForPersistence(item, blobStore, key, lossless);
 			if (newItem !== item) changed = true;
 			result[i] = newItem;
 		}
@@ -212,11 +238,11 @@ function truncateForPersistence(obj: unknown, blobStore: BlobStore, key?: string
 			const value = (obj as Record<string, unknown>)[childKey];
 			// Strip transient/redundant properties that shouldn't be persisted.
 			// - jsonlEvents: raw subprocess streaming events (already saved to artifact files)
-			if (childKey === "jsonlEvents") {
+			if (childKey === "jsonlEvents" && !lossless) {
 				changed = true;
 				continue;
 			}
-			const newValue = truncateForPersistence(value, blobStore, childKey);
+			const newValue = truncateForPersistence(value, blobStore, childKey, lossless);
 			if (newValue !== value) changed = true;
 			entries.push([childKey, newValue]);
 		}
@@ -476,7 +502,155 @@ function stripSpilledMcpStructuredContent(entry: FileEntry): FileEntry {
 	return { ...entry, message: { ...entry.message, details: persistedDetails } };
 }
 
+/** Dry run of the JSON/clone boundary; oversized strings are supported by blob spill. */
+export function assertLosslessPersistence(value: unknown, seen = new Set<object>(), key?: string): void {
+	if (value === null || value === undefined || typeof value === "string" || typeof value === "boolean") return;
+	if (typeof value === "number" && Number.isFinite(value)) return;
+	if (typeof value !== "object") throw new Error("Non-JSON value in context projection");
+	if (seen.has(value)) throw new Error("Circular value in context projection");
+	if (
+		!Array.isArray(value) &&
+		Object.getPrototypeOf(value) !== Object.prototype &&
+		Object.getPrototypeOf(value) !== null
+	)
+		throw new Error("Non-JSON object in context projection");
+	if (
+		isRecord(value) &&
+		((typeof value.image_url === "string" && isBlobRef(value.image_url)) ||
+			(value.type === "image_generation_call" && typeof value.result === "string" && isBlobRef(value.result)) ||
+			(isExternalizableImagePosition(value, key) && isBlobRef(value.data)))
+	)
+		throw new Error("CLM projection image blob has not been hydrated");
+	seen.add(value);
+	if (Array.isArray(value)) {
+		for (const child of value) assertLosslessPersistence(child, seen, key);
+	} else {
+		for (const [childKey, child] of Object.entries(value)) assertLosslessPersistence(child, seen, childKey);
+	}
+	seen.delete(value);
+}
+
+interface PersistedStringBlob {
+	path: string[];
+	ref: string;
+}
+
+function hasOversizedString(value: unknown): boolean {
+	if (typeof value === "string") return value.length > MAX_PERSIST_CHARS;
+	if (value === null || typeof value !== "object") return false;
+	for (const child of Object.values(value)) if (hasOversizedString(child)) return true;
+	return false;
+}
+
+function spillProjectionStrings(
+	value: unknown,
+	blobs: BlobStore,
+	refs: PersistedStringBlob[],
+	path: string[],
+): unknown {
+	if (typeof value === "string" && value.length > MAX_PERSIST_CHARS) {
+		// JSON encoding preserves lone UTF-16 surrogates as well as ordinary Unicode.
+		refs.push({ path, ref: blobs.putSync(Buffer.from(JSON.stringify(value))).ref });
+		return "";
+	}
+	if (value === null || typeof value !== "object") return value;
+	let changed = false;
+	const entries: [string, unknown][] = [];
+	for (const [key, child] of Object.entries(value)) {
+		const next = spillProjectionStrings(child, blobs, refs, [...path, key]);
+		changed ||= next !== child;
+		entries.push([key, next]);
+	}
+	return changed ? (Array.isArray(value) ? entries.map(([, child]) => child) : Object.fromEntries(entries)) : value;
+}
+
+/**
+ * Rehydrate only the host-owned projection manifest, never blob-looking user strings.
+ * Yields each blob hash to read and receives its bytes, so the async and sync readers share one validation path.
+ */
+function* projectionStringHydration(entry: unknown): Generator<string, void, Buffer | null> {
+	if (!isRecord(entry) || entry.type !== "context_projection" || entry.clmStringBlobs === undefined) return;
+	if (!Array.isArray(entry.clmStringBlobs)) throw new Error("Malformed CLM string blob manifest");
+	for (const item of entry.clmStringBlobs) {
+		if (
+			!isRecord(item) ||
+			!Array.isArray(item.path) ||
+			item.path.length === 0 ||
+			!item.path.every(part => typeof part === "string") ||
+			typeof item.ref !== "string"
+		)
+			throw new Error("Malformed CLM string blob reference");
+		const hash = parseBlobRef(item.ref);
+		if (!hash) throw new Error("Invalid CLM string blob hash");
+		let parent: unknown = entry;
+		for (const key of item.path.slice(0, -1)) {
+			if (!isRecord(parent) && !Array.isArray(parent)) throw new Error("Invalid CLM string blob path");
+			if (!Object.hasOwn(parent, key)) throw new Error("Invalid CLM string blob path");
+			parent = Reflect.get(parent, key);
+		}
+		const key = item.path.at(-1)!;
+		if (
+			(!isRecord(parent) && !Array.isArray(parent)) ||
+			!Object.hasOwn(parent, key) ||
+			Reflect.get(parent, key) !== ""
+		)
+			throw new Error("Invalid CLM string blob target");
+		const data = yield hash;
+		if (!data) throw new Error("Missing string blob required by CLM context projection");
+		const text: unknown = JSON.parse(data.toString());
+		if (typeof text !== "string") throw new Error("Invalid CLM string blob content");
+		Reflect.set(parent, key, text);
+	}
+	delete entry.clmStringBlobs;
+}
+
+export async function hydrateProjectionStrings(entry: unknown, blobs: BlobStore): Promise<void> {
+	const reads = projectionStringHydration(entry);
+	for (let step = reads.next(); !step.done; step = reads.next(await blobs.get(step.value)));
+}
+
+/** Synchronous {@link hydrateProjectionStrings}. */
+export function hydrateProjectionStringsSync(entry: unknown, blobs: BlobStore): void {
+	const reads = projectionStringHydration(entry);
+	for (let step = reads.next(); !step.done; step = reads.next(blobs.getSync(step.value)));
+}
+
 export function prepareEntryForPersistence(entry: FileEntry, blobStore: BlobStore): FileEntry {
+	if (entry.type === "message") {
+		const hashes: Record<string, string> = { ...entry.archiveStringHashes };
+		const collect = (value: unknown, keys: (string | number)[]): void => {
+			if (typeof value === "string") {
+				if (value.length > MAX_PERSIST_CHARS && !isPersistenceTruncatedString(value))
+					hashes[JSON.stringify(keys)] = Bun.hash(value).toString(16);
+			} else if (Array.isArray(value)) {
+				value.forEach((item, index) => collect(item, [...keys, index]));
+			} else if (isRecord(value)) {
+				const contentBlock = keys.length === 2 && keys[0] === "content";
+				if (
+					contentBlock &&
+					(value.type === "image" ||
+						value.type === "redactedThinking" ||
+						value.type === "fallback" ||
+						value.type === "anthropicServerTool")
+				)
+					return;
+				for (const [key, item] of Object.entries(value)) {
+					const ignored =
+						(keys.length === 0 && !Object.hasOwn(CLM_ARCHIVE_TEXT_FIELDS, key)) ||
+						(contentBlock && key.endsWith("Signature"));
+					if (!ignored) collect(item, [...keys, key]);
+				}
+			}
+		};
+		collect(entry.message, []);
+		if (Object.keys(hashes).length > 0) entry = { ...entry, archiveStringHashes: hashes };
+	}
 	const projected = stripSpilledMcpStructuredContent(stripReplayedReasoningSignatures(entry));
-	return truncateForPersistence(projected, blobStore) as FileEntry;
+	if (entry.type === "context_projection") assertLosslessPersistence(projected);
+	const prepared = truncateForPersistence(projected, blobStore, undefined, entry.type === "context_projection");
+	if (entry.type !== "context_projection") return prepared as FileEntry;
+	if (!hasOversizedString(prepared)) return prepared as FileEntry;
+	const refs: PersistedStringBlob[] = [];
+	const spilled = spillProjectionStrings(prepared, blobStore, refs, []);
+	return (refs.length ? { ...(spilled as FileEntry), clmStringBlobs: refs } : spilled) as FileEntry;
 }

@@ -11,6 +11,7 @@ import type { BashResult } from "../../exec/bash-executor";
 import type { ContextUsage } from "../../extensibility/extensions/types";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
 import type { CacheWarmingMode } from "../../session/cache-warmer";
+import type { ClmReadTarget } from "../../session/clm-types";
 import type { FileEntry, SessionEntry, SessionTreeNode } from "../../session/session-entries";
 import type { AvailableSlashCommandSource } from "../../slash-commands/available-commands";
 import type { AgentProgress } from "@oh-my-pi/pi-tui/tools/task";
@@ -75,6 +76,10 @@ export type RpcCommand =
 	// Compaction
 	| { id?: string; type: "compact"; customInstructions?: string }
 	| { id?: string; type: "set_auto_compaction"; enabled: boolean }
+
+	// Experimental context revisions (reads remain available while disabled)
+	| { id?: string; type: "get_clm_context"; target: ClmReadTarget }
+	| { id?: string; type: "restore_clm_context"; revision: string }
 
 	// Cache warming
 	| { id?: string; type: "set_cache_warming"; mode: CacheWarmingMode }
@@ -412,6 +417,10 @@ export type RpcResponse =
 	// Compaction
 	| { id?: string; type: "response"; command: "compact"; success: true; data: CompactionResult }
 	| { id?: string; type: "response"; command: "set_auto_compaction"; success: true }
+
+	// Experimental context revisions
+	| { id?: string; type: "response"; command: "get_clm_context"; success: true; data: { text: string } }
+	| { id?: string; type: "response"; command: "restore_clm_context"; success: true; data: { text: string } }
 
 	// Cache warming
 	| { id?: string; type: "response"; command: "set_cache_warming"; success: true; data: { mode: CacheWarmingMode } }

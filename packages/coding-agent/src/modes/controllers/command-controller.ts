@@ -41,7 +41,9 @@ import { getMarkdownTheme, getSymbolTheme, theme, type Theme } from "@oh-my-pi/p
 import type { InteractiveModeContext } from "../../modes/types";
 import { ContextUsageView } from "@oh-my-pi/pi-tui/status-line/context-usage";
 import { JobsPanel } from "@oh-my-pi/pi-tui/overlays/jobs-panel";
+import { ContextInspector } from "@oh-my-pi/pi-tui/overlays/context-inspector";
 import { computeSessionContextBreakdown } from "../../session/context-usage-runtime";
+import { runContextCommand } from "../../slash-commands/helpers/clm-context";
 import { buildHotkeysMarkdown, HotkeysSheetComponent } from "@oh-my-pi/pi-tui/hotkeys-markdown";
 import { isNativeRendering } from "@oh-my-pi/pi-tui/native/state";
 import { buildToolsMarkdown } from "@oh-my-pi/pi-tui/prompt/tools-markdown";
@@ -713,13 +715,53 @@ export class CommandController {
 		showMarkdownPanel(this.ctx, "Available Tools", tools);
 	}
 
-	handleContextCommand(): void {
-		const breakdown = computeSessionContextBreakdown(this.ctx.session, { snapcompactSavings: true });
-		if (breakdown.contextWindow <= 0) {
-			this.ctx.showWarning("Context usage is unavailable: no model is selected for this session.");
+	async handleContextCommand(args = ""): Promise<void> {
+		if (!args && this.ctx.viewSession.getClmContext().isEnabled()) {
+			this.#showContextInspector();
 			return;
 		}
-		this.ctx.presentCommandOutput(new ContextUsageView(breakdown, theme));
+		const text = await runContextCommand(this.ctx.session, args);
+		this.ctx.presentCommandOutput([new Spacer(1), new Text(text, 1, 0)]);
+		if (args) return;
+		const breakdown = computeSessionContextBreakdown(this.ctx.session, { snapcompactSavings: true });
+		if (breakdown.contextWindow > 0) {
+			this.ctx.presentCommandOutput(new ContextUsageView(breakdown, theme));
+		}
+	}
+
+	/** The read-only `/context` inspector: CLM blocks, revision diffs, and archive search in a fullscreen frame. */
+	#showContextInspector(): void {
+		const session = this.ctx.viewSession;
+		const context = session.getClmContext();
+		const owner = context.ownerSessionId;
+		const clm = session.getClmInspector();
+		let inspector: ContextInspector;
+		try {
+			inspector = new ContextInspector({
+				isCurrent: () =>
+					this.ctx.viewSession === session && context.ownerSessionId === owner && context.isEnabled(),
+				load: () => clm.inspect(),
+				diff: revision => clm.revisionDiff(revision),
+				search: (query, regex, signal) => clm.searchArchive(query, regex, signal),
+				requestRender: () => this.ctx.ui.requestRender(),
+				close: () => {
+					handle.hide();
+					this.ctx.ui.requestRender();
+				},
+			});
+		} catch (error) {
+			this.ctx.showError(`Context inspector unavailable: ${error instanceof Error ? error.message : String(error)}`);
+			return;
+		}
+		const handle = this.ctx.ui.showOverlay(inspector, {
+			anchor: "bottom-center",
+			width: "100%",
+			maxHeight: "100%",
+			margin: 0,
+			fullscreen: true,
+		});
+		this.ctx.ui.setFocus(inspector);
+		this.ctx.ui.requestRender();
 	}
 
 	async handleMemoryCommand(text: string): Promise<void> {

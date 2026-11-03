@@ -24,6 +24,7 @@ import type { ToolSession } from "../tools";
 import type { CoordinationDetails } from "@oh-my-pi/pi-tui/tools/wait";
 import type { ProcReadDetails, ProcWriteDetails } from "@oh-my-pi/pi-tui/tools/proc-render";
 import type { CfgReadDetails, CfgWriteDetails } from "@oh-my-pi/pi-tui/tools/cfg-render";
+import type { ClmReadDetails } from "@oh-my-pi/pi-tui/tools/clm-render";
 import type { XdevRenderDispatch } from "@oh-my-pi/pi-tui/tools/xdev";
 
 /** Transcript-only render state a handler write attaches to the `write` tool result. */
@@ -141,6 +142,8 @@ export interface LocateOptions {
  * process facts (binary presence) in {@link ProtocolHandler.promptDoc}.
  */
 export interface SchemeHost {
+	/** This host actually exposes an enabled, session-owned CLM capability. */
+	clmEnabled?: boolean;
 	/** Loaded skills are readable through an active tool. */
 	skillUriAccess: boolean;
 	/** Number of rulebook rules addressable through rule://. */
@@ -174,6 +177,8 @@ export interface InternalResource {
 	details?: {
 		proc?: ProcReadDetails;
 		cfg?: CfgReadDetails;
+		/** `context://` reads: the CLM document, status, history, diff, or archive as transcript data. */
+		clm?: ClmReadDetails;
 		/** Prefix-free text + gutter start for the TUI read card when `content` carries hashline/line prefixes (conflict://). */
 		display?: { text: string; startLine: number; lineNumbers?: Array<number | null> };
 	};
@@ -314,6 +319,11 @@ export interface ResolveContext {
 	 * reject directory resources, so they never need the listing.
 	 */
 	skipDirectoryListing?: boolean;
+	/**
+	 * The read slices lines after the first one (a later page or a tail), so a
+	 * snapshot-backed handler must serve the snapshot the earlier pages came from.
+	 */
+	continuesLines?: boolean;
 }
 
 /**

@@ -1,4 +1,5 @@
 import { DEFAULT_MAX_BYTES, type OutputArtifactError, OutputSink } from "@oh-my-pi/pi-tui/tools/streaming-output";
+import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import type { ToolSession } from "../../tools";
 import {
 	resolveOutputMaxColumns,
@@ -41,6 +42,7 @@ export interface JsExecutorOptions {
 	artifactPath?: string;
 	artifactId?: string;
 	session: ToolSession;
+	toolContext?: AgentToolContext;
 	/** On-disk roots the helpers substitute for internal-URL schemes (e.g. `local://`). */
 	localRoots?: Record<string, string>;
 }
@@ -174,6 +176,7 @@ export async function executeJs(code: string, options: JsExecutorOptions): Promi
 			filename: options.filename ?? `js-cell-${crypto.randomUUID()}.js`,
 			timeoutMs: runtimeTimeoutMs ?? options.idleTimeoutMs,
 			runState: {
+				toolContext: options.toolContext,
 				signal,
 				onText: chunk => outputSink.push(chunk),
 				onDisplay: output => {

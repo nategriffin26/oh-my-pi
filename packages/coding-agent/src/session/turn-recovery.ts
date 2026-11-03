@@ -45,6 +45,7 @@ import {
 } from "@oh-my-pi/pi-tui/thinking";
 import type { EditMode } from "@oh-my-pi/pi-tui/tools/edit";
 import type { AgentSessionEvent } from "./agent-session-events";
+import { CLM_CAPACITY_ERROR_PREFIX } from "./clm-budget";
 import type { ResetRecoveryResult } from "./codex-auto-reset";
 import type {
 	InitialRetryFallbackState,
@@ -1409,6 +1410,8 @@ export class TurnRecovery {
 	isRetryableError(message: AssistantMessage): boolean {
 		if (message.stopReason !== "error") return false;
 		if (this.#isUsagePreflightBlocked(message)) return false;
+		// A CLM capacity refusal is a deterministic local verdict on unchanged context; replay can never fit.
+		if (message.errorMessage?.startsWith(CLM_CAPACITY_ERROR_PREFIX) === true) return false;
 		if (AIError.isResponsesRequestBodyReadTimeout(message)) return false;
 		const model = this.#host.model();
 		const immutableAnthropicThinkingError =

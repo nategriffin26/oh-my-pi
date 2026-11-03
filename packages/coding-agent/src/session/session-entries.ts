@@ -52,6 +52,8 @@ export interface SessionHeader {
 	previousSessionFiles?: string[];
 	/** Provider prompt-cache identity inherited by exact-route full forks. */
 	providerPromptCacheKey?: string;
+	/** Required semantic readers, independent of the legacy JSONL version. */
+	requiredFeatures?: Record<string, number>;
 }
 
 export interface NewSessionOptions {
@@ -76,6 +78,24 @@ export interface SessionEntryBase {
 export interface SessionMessageEntry extends SessionEntryBase {
 	type: "message";
 	message: AgentMessage;
+	/** Hashes of oversized originals keyed by JSON paths within message; archive identity survives truncation. */
+	archiveStringHashes?: Record<string, string>;
+}
+
+/** Owned effective context, independent of mutable transcript provenance. */
+export interface ContextProjectionEntry extends SessionEntryBase {
+	type: "context_projection";
+	version: 1;
+	previousRevisionId?: string;
+	coveredThroughEntryId: string | null;
+	messages: AgentMessage[];
+	rewriteAt: number;
+	tokensBefore: number;
+	tokensAfter: number;
+	cause: "edit" | "restore" | "rebase" | "compact" | "diagnostics" | "spill";
+	/** Archive size and growth at publication, for stable historical edit receipts. */
+	archiveItems?: number;
+	archiveGrowth?: number;
 }
 
 /** Usage from a model call that does not belong in the conversation transcript. */
@@ -203,6 +223,7 @@ declare module "@oh-my-pi/pi-agent-core/compaction/entries" {
 		titleChange: TitleChangeEntry;
 		credentialPin: CredentialPinEntry;
 		modelUsage: ModelUsageEntry;
+		contextProjection: ContextProjectionEntry;
 	}
 }
 
@@ -301,6 +322,7 @@ export interface CustomMessageEntry<T = unknown> extends SessionEntryBase {
 
 /** Session entry - has id/parentId for tree structure (returned by "read" methods in SessionManager) */
 export type SessionEntry =
+	| ContextProjectionEntry
 	| SessionMessageEntry
 	| ModelUsageEntry
 	| ThinkingLevelChangeEntry

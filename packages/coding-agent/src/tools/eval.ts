@@ -526,6 +526,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			throw new ToolError("Eval tool requires a session when not using proxy executor");
 		}
 		const session = this.session;
+		const toolContext = ctx ?? session.getToolContext?.();
 		const excludeWebP = webpExclusionForModel(session.getActiveModel?.());
 
 		const cellLanguage: EvalLanguage = params.language === "py" ? "python" : "js";
@@ -588,6 +589,17 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			const execution = runWithEvalShadowCell(activeShadowCell, () =>
 				this.#runCells({
 					session,
+					toolContext: toolContext
+						? {
+								...toolContext,
+								toolCall: toolContext.toolCall ?? {
+									batchId: _toolCallId,
+									index: 0,
+									total: 1,
+									toolCalls: [{ id: _toolCallId, name: "eval" }],
+								},
+							}
+						: undefined,
 					cells,
 					languages,
 					notice,
@@ -756,6 +768,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 	 */
 	async #runCells(options: {
 		session: ToolSession;
+		toolContext?: AgentToolContext;
 		cells: ResolvedEvalCell[];
 		languages: EvalLanguage[];
 		notice: string | undefined;
@@ -930,6 +943,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 						kernelOwnerId,
 						signal: combinedSignal,
 						session,
+						toolContext: options.toolContext,
 						idleTimeoutMs,
 						reset: cell.reset,
 						filename: cell.filename,

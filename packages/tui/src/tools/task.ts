@@ -17,7 +17,7 @@ import { visibleWidth, wrapTextWithAnsi } from "../utils";
 import { sanitizeText } from "@oh-my-pi/pi-utils";
 import type { RenderResultOptions } from "./renderer";
 import { formatAgentStatRun, renderAgentTreeRow } from "./agent-tree";
-import { getMarkdownTheme, type Theme } from "../theme/theme";
+import { getMarkdownTheme, type Theme, theme as uiTheme } from "../theme/theme";
 import { stripGeneratedOutputNotice, stripRawOutputArtifactNotice, stripTrailingNotice } from "./output-meta";
 import {
 	capPreviewLines,
@@ -665,6 +665,67 @@ function renderRouteLine(route: string | undefined, continuePrefix: string, maxW
 	];
 }
 
+/**
+ * One agent's own handoff as styled parts: a curated seed's items, tokens, manifest, pinned
+ * requests, and what the seed cap cut (ids with sizes); a brief's parent-archive access; a fork's
+ * inherited transcript.
+ */
+function handoffParts(
+	handoff: TaskHandoffSummary,
+	theme: Theme,
+): [text: string, color: "accent" | "dim" | "warning"][] {
+	const glyph = theme.symbol("cmd.handoff");
+	const parts: [string, "accent" | "dim" | "warning"][] = glyph ? [[`${glyph} `, "accent"]] : [];
+	const sep = theme.sep.dot;
+	switch (handoff.mode) {
+		case "curated": {
+			let head = `curated${sep}${handoff.items} ${pluralize("item", handoff.items)} ~${formatNumber(handoff.tokens)}`;
+			if (handoff.manifestTokens > 0) head += ` + manifest ~${formatNumber(handoff.manifestTokens)}`;
+			if (handoff.pinned > 0) head += `${sep}${theme.symbol("icon.pin")} ${handoff.pinned} pinned`;
+			parts.push([head, "dim"]);
+			if (handoff.omitted.length > 0) {
+				parts.push([`${sep}omitted `, "dim"]);
+				parts.push([
+					handoff.omitted
+						.map(entry => `${entry.id}${entry.lines ? `:${entry.lines}` : ""} (${formatNumber(entry.tokens)})`)
+						.join(", "),
+					"warning",
+				]);
+			}
+			if (handoff.excluded.length > 0)
+				parts.push([`${sep}withheld from reviewer ${handoff.excluded.join(", ")}`, "dim"]);
+			break;
+		}
+		case "brief":
+			parts.push([
+				`brief${sep}parent archive readable${handoff.independent ? `${sep}reasoning withheld` : ""}`,
+				"dim",
+			]);
+			break;
+		case "fork":
+			parts.push([`fork${sep}parent transcript ~${formatNumber(handoff.tokens)}`, "dim"]);
+			break;
+	}
+	return parts;
+}
+
+/** The dim handoff line under an agent row; one truncated row collapsed, wrapped when expanded. */
+function renderHandoffLine(
+	handoff: TaskHandoffSummary | undefined,
+	continuePrefix: string,
+	expanded: boolean,
+	maxWidth: number,
+	theme: Theme,
+): string[] {
+	if (!handoff) return [];
+	const line = handoffParts(handoff, theme)
+		.map(([part, color]) => theme.fg(color, part))
+		.join("");
+	if (!expanded || !Number.isFinite(maxWidth)) return [truncateTaskRow(`${continuePrefix}${line}`, maxWidth)];
+	const contentWidth = Math.max(1, maxWidth - visibleWidth(continuePrefix));
+	return wrapTextWithAnsi(line, contentWidth).map(wrapped => `${continuePrefix}${wrapped}`);
+}
+
 /** A tool call's own intent, else its argument, with home paths shortened as the subagent HUD does. */
 function toolCallDetail(intent: string | undefined, args: string | undefined, argsKey: string | undefined): string {
 	return intent ? shortenEmbeddedPaths(intent) : shortenToolArgumentPaths(args ?? "", argsKey);
@@ -723,6 +784,7 @@ function renderAgentProgress(
 		lines.push(...renderDescriptionLines(fullDescription, continuePrefix, maxWidth, theme));
 	}
 	lines.push(...renderRouteLine(progress.resolvedModelRoute, continuePrefix, maxWidth, theme));
+	lines.push(...renderHandoffLine(progress.handoff, continuePrefix, expanded, maxWidth, theme));
 
 	lines.push(...renderTaskSection(progress.assignment ?? progress.task, continuePrefix, expanded, theme));
 
@@ -1069,6 +1131,7 @@ function renderAgentResult(
 		lines.push(...renderDescriptionLines(fullDescription, continuePrefix, maxWidth, theme));
 	}
 	lines.push(...renderRouteLine(result.resolvedModelRoute, continuePrefix, maxWidth, theme));
+	lines.push(...renderHandoffLine(result.handoff, continuePrefix, expanded, maxWidth, theme));
 
 	lines.push(...renderTaskSection(result.assignment ?? result.task, continuePrefix, expanded, theme));
 
@@ -1738,6 +1801,15 @@ function describeAssignment(raw: string | undefined): NativeNode | undefined {
 	return source ? md(source, { role: "omp.task.assignment" }) : undefined;
 }
 
+/** The agent's own handoff line (see {@link renderHandoffLine}) under its assignment. */
+function describeHandoff(handoff: TaskHandoffSummary | undefined): NativeNode | undefined {
+	if (!handoff) return undefined;
+	return text(
+		handoffParts(handoff, uiTheme).map(([part, color]) => span(part, color)),
+		{ wrap: "word", role: "omp.task.handoff" },
+	);
+}
+
 /** Context-window stats: the fill fraction and its `19K / 200K` label. */
 function contextStats(
 	tokens: number | undefined,
@@ -1849,6 +1921,7 @@ function describeProgressAgent(progress: AgentProgress, state: AgentDescribeStat
 		[
 			describeAssignment(progress.assignment ?? progress.task),
 			progress.resolvedModelRoute ? noteText(progress.resolvedModelRoute, "dim") : undefined,
+			describeHandoff(progress.handoff),
 			!running && progress.retryFailure
 				? text(
 						[
@@ -1906,6 +1979,7 @@ function describeResultAgent(result: SingleResult, state: AgentDescribeState, de
 		[
 			describeAssignment(result.assignment ?? result.task),
 			result.resolvedModelRoute ? noteText(result.resolvedModelRoute, "dim") : undefined,
+			describeHandoff(result.handoff),
 			aborted && result.abortReason ? errorLine(result.abortReason) : undefined,
 			warning ? errorLine(warning, "warning") : undefined,
 			result.error ? errorLine(result.error) : undefined,
@@ -2159,7 +2233,49 @@ export interface TaskItem {
 	tools?: string[];
 	/** Run this spawn in an isolated worktree (batch form; flat form carries it top-level). */
 	isolated?: boolean;
+	/** Parent archive refs copied verbatim into the child: `h<id>` archive ids or `b<N>` blocks of the latest context://self snapshot, optional `:N-M` line range. */
+	handoff?: string[];
+	/** `curated`: seed + archive index; `brief`: assignment + shared context only; `fork`: child starts from the parent's persisted transcript. Omitted: the user's `compaction.clmHandoffDefault` (curated unless changed) for CLM parents. */
+	handoffMode?: TaskHandoffMode;
+	/** Auto-pin the parent's user requirement messages into the handoff seed (default true). */
+	pinRequirements?: boolean;
 }
+
+/** How much parent context a spawned child receives. */
+export type TaskHandoffMode = "curated" | "brief" | "fork";
+
+/** One handed-off item that did not fit the curated seed; readable at `context://parent/archive/<id>`. */
+export interface TaskHandoffOmission {
+	id: string;
+	tokens: number;
+	/** `N-M` when only those lines were requested. */
+	lines?: string;
+}
+
+/**
+ * What one spawned agent received from its CLM parent, for the task card's handoff line. Absent when
+ * the parent does not run CLM (the child gets the assignment and shared context only).
+ */
+export type TaskHandoffSummary =
+	| {
+			mode: "curated";
+			/** Items copied into the seed, `pinned` of them the parent's user requests. */
+			items: number;
+			pinned: number;
+			/** Seed tokens, as the parent-visible handoff cost reports them. */
+			tokens: number;
+			/** System-prompt manifest of the parent's other items; 0 when there is none. */
+			manifestTokens: number;
+			/** Items over the seed cap or the pinned-request budget. */
+			omitted: TaskHandoffOmission[];
+			/** Requested ids withheld from an independent reviewer (parent reasoning). */
+			excluded: string[];
+			independent: boolean;
+	  }
+	/** Assignment and shared context only; the parent archive stays readable (reasoning withheld when `independent`). */
+	| { mode: "brief"; independent: boolean }
+	/** The parent transcript up to its last completed exchange; `tokens` of it in context. */
+	| { mode: "fork"; tokens: number };
 
 /**
  * Runtime params union over both wire shapes. The model sees exactly one shape
@@ -2190,6 +2306,12 @@ export interface TaskParams {
 	context?: string;
 	/** Run in an isolated worktree (flat form; per-item in batch form). */
 	isolated?: boolean;
+	/** Parent archive refs (flat form); see {@link TaskItem.handoff}. */
+	handoff?: string[];
+	/** Handoff mode (flat form); see {@link TaskItem.handoffMode}. */
+	handoffMode?: TaskHandoffMode;
+	/** Requirement pinning (flat form); see {@link TaskItem.pinRequirements}. */
+	pinRequirements?: boolean;
 }
 
 /**
@@ -2310,6 +2432,8 @@ export interface AgentProgress {
 	resolvedModelIsFallback?: boolean;
 	/** Extension routing note (e.g. model-pools) explaining why {@link resolvedModel} was chosen. */
 	resolvedModelRoute?: string;
+	/** What this agent received from its CLM parent (each spawn resolves its own handoff). */
+	handoff?: TaskHandoffSummary;
 	/** True when a live advisor was attached to this run's session, not merely enabled in settings. */
 	advisor?: boolean;
 	/** Data extracted by registered subprocess tool handlers (keyed by tool name) */
@@ -2389,6 +2513,8 @@ export interface SingleResult {
 	resolvedModelIsFallback?: boolean;
 	/** Mirrors {@link AgentProgress.resolvedModelRoute} onto the settled result. */
 	resolvedModelRoute?: string;
+	/** Mirrors {@link AgentProgress.handoff} onto the settled result. */
+	handoff?: TaskHandoffSummary;
 	/** Retains {@link AgentProgress.advisor} after the advised session is disposed. */
 	advisor?: boolean;
 	error?: string;

@@ -192,7 +192,7 @@ export class SessionFocusController {
 				});
 				if (generation === this.#attachGeneration) this.ctx.eventController.restorePendingToolResults();
 			};
-			this.ctx.unsubscribe = target.subscribe(async event => {
+			const unsubscribeEvents = target.subscribe(async event => {
 				if (generation !== this.#attachGeneration) return;
 				if (event.type === "message_start" && event.message.role === "assistant") {
 					assistantStreamSynced = true;
@@ -211,6 +211,13 @@ export class SessionFocusController {
 				if (event.type === "message_end" && event.message.role === "assistant") assistantStreamSynced = false;
 				await this.ctx.eventController.handleEvent(event);
 			});
+			const unsubscribeClm = target.subscribeClmActivity(activity => {
+				if (generation === this.#attachGeneration) this.ctx.eventController.handleClmActivity(activity);
+			});
+			this.ctx.unsubscribe = () => {
+				unsubscribeEvents();
+				unsubscribeClm();
+			};
 
 			await target.settleInFlightMessagePersistence();
 			if (generation !== this.#attachGeneration) return false;

@@ -21,6 +21,10 @@ import {
 	createHandoffSummaryMessageComponent,
 } from "@oh-my-pi/pi-tui/chat/compaction-summary-message";
 import { CustomMessageComponent } from "@oh-my-pi/pi-tui/chat/custom-message";
+import { ClmContextEditComponent, type ClmContextEditRow } from "@oh-my-pi/pi-tui/chat/clm-context-edit";
+import { ClmNoteMessageComponent } from "@oh-my-pi/pi-tui/chat/clm-note-message";
+import { ClmNoticeComponent } from "@oh-my-pi/pi-tui/chat/clm-notice";
+import { ClmRewrittenHistoryComponent, transcriptBlocks } from "@oh-my-pi/pi-tui/chat/clm-rewritten-history";
 import { DynamicBorder } from "@oh-my-pi/pi-tui/chrome/dynamic-border";
 import { EvalExecutionComponent } from "@oh-my-pi/pi-tui/chat/eval-execution";
 import {
@@ -46,6 +50,11 @@ import { materializeImageReferenceLinksSync } from "@oh-my-pi/pi-tui/prompt/imag
 import { imageAttachmentSource } from "@oh-my-pi/pi-tui/prompt/image-source";
 import { theme } from "@oh-my-pi/pi-tui/theme";
 import type { CompactionQueuedMessage, InteractiveModeContext, RenderSessionContextOptions } from "../../modes/types";
+import type { ClmArchive } from "../../session/clm-archive";
+import { type ClmHistory, resolveClmHistory } from "../../session/clm-history";
+import { CLM_FEEDBACK_MESSAGE_TYPE } from "../../session/clm-state";
+import type { ClmFeedbackDetails } from "../../session/clm-types";
+import { cfgCompactionClmShowContextEdits } from "../../session/context-settings";
 import { LAUNCH_COMPLETION_MESSAGE_TYPE } from "../../session/launch-completion";
 import {
 	BACKGROUND_TAN_DISPATCH_MESSAGE_TYPE,
@@ -109,6 +118,11 @@ function waitForImmediate(): Promise<void> {
 	return promise;
 }
 
+/** A transcript warning line, as {@link UiHelpers.showWarning} presents it. */
+function warningLines(message: string): Component[] {
+	return [new Spacer(1), new Text(`Warning: ${message}`, 1, 0).setStyleFn(t => theme.fg("warning", t))];
+}
+
 type QueuedMessages = {
 	steering: string[];
 	followUp: string[];
@@ -116,6 +130,7 @@ type QueuedMessages = {
 type AddMessageOptions = {
 	imageLinks?: readonly (string | undefined)[];
 	reuseSettledComponent?: boolean;
+	appendTo?: (component: Component) => void;
 };
 
 function imageLinksForMessage(
@@ -156,6 +171,10 @@ export class UiHelpers {
 	}
 
 	addMessageToChat(message: AgentMessage, options?: AddMessageOptions): Component[] {
+		const append = (component: Component) => {
+			if (options?.appendTo) options.appendTo(component);
+			else this.ctx.chatContainer.addChild(component);
+		};
 		switch (message.role) {
 			case "bashExecution": {
 				const component = new BashExecutionComponent(message.command, this.ctx.ui, message.excludeFromContext);
@@ -168,7 +187,7 @@ export class UiHelpers {
 					images: message.images,
 					showImages: cfgTerminalShowImages.get(settings),
 				});
-				this.ctx.chatContainer.addChild(component);
+				append(component);
 				break;
 			}
 			case "pythonExecution": {
@@ -180,7 +199,7 @@ export class UiHelpers {
 					truncation: message.meta?.truncation,
 					artifactError: message.meta?.artifactError,
 				});
-				this.ctx.chatContainer.addChild(component);
+				append(component);
 				break;
 			}
 			case "hookMessage":
@@ -188,7 +207,7 @@ export class UiHelpers {
 				if (message.display) {
 					if (message.customType === "async-result") {
 						const component = buildAsyncResultBlock(message);
-						this.ctx.chatContainer.addChild(component);
+						append(component);
 						break;
 					}
 					if (message.customType === LSP_LATE_DIAGNOSTIC_MESSAGE_TYPE) {
@@ -198,26 +217,29 @@ export class UiHelpers {
 							}>
 						).details;
 						// Native: into the edit/write frames they belong to; the rest stand alone.
-						const files = routeLateDiagnostics(this.ctx.chatContainer.children, details?.files ?? []);
+						const files = routeLateDiagnostics(
+							[...transcriptBlocks(this.ctx.chatContainer.children)],
+							details?.files ?? [],
+						);
 						if (files.length === 0) break;
 						const component = new LateDiagnosticsMessageComponent(files);
 						component.setExpanded(this.ctx.toolOutputExpanded);
-						this.ctx.chatContainer.addChild(component);
+						append(component);
 						break;
 					}
 					if (message.customType === LAUNCH_COMPLETION_MESSAGE_TYPE) {
-						this.ctx.chatContainer.addChild(buildLaunchCompletionBlock(message));
+						append(buildLaunchCompletionBlock(message));
 						break;
 					}
 					if (message.customType === COLLAB_PROMPT_MESSAGE_TYPE) {
 						const component = new CollabPromptMessageComponent(message as CustomMessage<CollabPromptDetails>);
-						this.ctx.chatContainer.addChild(component);
+						append(component);
 						break;
 					}
 					if (message.customType === SKILL_PROMPT_MESSAGE_TYPE) {
 						const component = new SkillMessageComponent(message as CustomMessage<SkillPromptDetails>);
 						component.setExpanded(this.ctx.toolOutputExpanded);
-						this.ctx.chatContainer.addChild(component);
+						append(component);
 						break;
 					}
 					if (
@@ -227,18 +249,16 @@ export class UiHelpers {
 						message.customType === "irc:workpool"
 					) {
 						const card = buildIrcMessageCard(message, () => this.ctx.toolOutputExpanded);
-						this.ctx.chatContainer.addChild(card);
+						append(card);
 						return [card];
 					}
 					if (message.customType === "advisor") {
 						const details = (message as CustomMessage<AdvisorMessageDetails>).details;
-						this.ctx.chatContainer.addChild(
-							createAdvisorMessageCard(details, () => this.ctx.toolOutputExpanded, theme),
-						);
+						append(createAdvisorMessageCard(details, () => this.ctx.toolOutputExpanded, theme));
 						break;
 					}
 					if (message.customType === BACKGROUND_TAN_DISPATCH_MESSAGE_TYPE) {
-						this.ctx.chatContainer.addChild(createBackgroundTanDispatchBlock(message as CustomMessage<unknown>));
+						append(createBackgroundTanDispatchBlock(message as CustomMessage<unknown>));
 						break;
 					}
 					const handoffComponent = createHandoffSummaryMessageComponent(
@@ -246,33 +266,33 @@ export class UiHelpers {
 						this.ctx.toolOutputExpanded,
 					);
 					if (handoffComponent) {
-						this.ctx.chatContainer.addChild(handoffComponent);
+						append(handoffComponent);
 						break;
 					}
 					const renderer = this.ctx.viewSession.extensionRunner?.getMessageRenderer(message.customType);
 					// Both HookMessage and CustomMessage have the same structure, cast for compatibility
 					const component = new CustomMessageComponent(message as CustomMessage<unknown>, renderer);
 					component.setExpanded(this.ctx.toolOutputExpanded);
-					this.ctx.chatContainer.addChild(component);
+					append(component);
 				}
 				break;
 			}
 			case "compactionSummary": {
 				const component = new CompactionSummaryMessageComponent(message);
 				component.setExpanded(this.ctx.toolOutputExpanded);
-				this.ctx.chatContainer.addChild(component);
+				append(component);
 				break;
 			}
 			case "branchSummary": {
 				const component = new BranchSummaryMessageComponent(message);
 				component.setExpanded(this.ctx.toolOutputExpanded);
-				this.ctx.chatContainer.addChild(component);
+				append(component);
 				break;
 			}
 			case "fileMention": {
 				// Render compact file mention display
 				const block = buildFileMentionBlock(message.files, 0);
-				if (block.children.length > 0) this.ctx.chatContainer.addChild(block);
+				if (block.children.length > 0) append(block);
 				break;
 			}
 			case "user":
@@ -303,7 +323,7 @@ export class UiHelpers {
 						});
 						this.ctx.transcriptMessageComponents.set(message, userComponent);
 					}
-					this.ctx.chatContainer.addChild(userComponent);
+					append(userComponent);
 				}
 				break;
 			}
@@ -323,7 +343,11 @@ export class UiHelpers {
 					this.ctx.transcriptMessageComponents.set(message, assistantComponent);
 				}
 				assistantComponent.pickReactionTarget(this.ctx.chatContainer.children);
-				this.ctx.chatContainer.addChild(assistantComponent);
+				append(assistantComponent);
+				break;
+			}
+			case "clmNote": {
+				// Projection-only context, not an executed transcript event. Inspect via /context show.
 				break;
 			}
 			case "toolResult": {
@@ -421,7 +445,7 @@ export class UiHelpers {
 			if (!usageAttached) {
 				readGroup?.seal();
 				readGroup = null;
-				this.ctx.chatContainer.addChild(
+				appendTranscript(
 					createUsageRowBlock(
 						pendingUsage,
 						pendingUsageDuration,
@@ -437,6 +461,28 @@ export class UiHelpers {
 			pendingUsageTimestamp = undefined;
 			pendingReadUsageCallIds = undefined;
 			pendingUsageTurnElapsed = undefined;
+		};
+		// History a committed CLM revision took out of the model's context stays readable but dim,
+		// one gutter run per consecutive stretch removed by the same revision.
+		const clmHistory = resolveClmHistory(this.ctx.viewSession.sessionManager.getBranch());
+		const clmArchive = clmHistory ? this.ctx.viewSession.getClmContext().archive() : undefined;
+		let clmRun: { group: ClmRewrittenHistoryComponent; revision: string; messages: AgentMessage[] } | undefined;
+		// Send removed blocks straight to their group; moving them through the transcript
+		// ledger scans the settled prefix per message and makes large edits quadratic.
+		const appendTranscript = (component: Component) => {
+			if (clmRun) clmRun.group.adopt(component);
+			else this.ctx.chatContainer.addChild(component);
+		};
+		const closeClmRun = () => {
+			if (!clmRun) return;
+			const ids = [...new Set(clmArchive?.idsFor(clmRun.messages) ?? [])];
+			clmRun.group.setHeader({
+				revision: clmRun.revision,
+				ids,
+				tokens: ids.reduce((sum, id) => sum + (clmArchive?.get(id)?.tokens ?? 0), 0),
+			});
+			clmRun.group.close();
+			clmRun = undefined;
 		};
 		// Rebuild-time mirror of the event controller's displaceable-poll
 		// bookkeeping: a `wait` that found every watched job still running is
@@ -485,6 +531,10 @@ export class UiHelpers {
 		const backgroundTaskCallIds = new Set<string>();
 		const messages = sessionContext.messages;
 		const count = messages.length;
+		const toolResults = new Map<string, Extract<AgentMessage, { role: "toolResult" }>>();
+		for (const message of messages) {
+			if (message.role === "toolResult") toolResults.set(message.toolCallId, message);
+		}
 		for (let i = 0; i < count; i++) {
 			// Yield BEFORE each message (except the first) rather than after: the
 			// per-message body has several early `continue` paths (preserved live
@@ -496,11 +546,33 @@ export class UiHelpers {
 			if (i > 0) yield;
 			const message = messages[i]!;
 			if (message.role !== "toolResult") flushPendingUsage();
+			const removedBy = clmHistory?.removedBy(message);
+			// Tool results follow their call's run; messages that render nothing never split one.
+			if (
+				clmHistory &&
+				message.role !== "toolResult" &&
+				!((message.role === "custom" || message.role === "hookMessage") && !message.display) &&
+				removedBy?.id !== clmRun?.revision
+			) {
+				readGroup?.seal();
+				readGroup = null;
+				closeClmRun();
+				if (removedBy) {
+					const group = new ClmRewrittenHistoryComponent({ revision: removedBy.id, ids: [], tokens: 0 });
+					this.ctx.chatContainer.addChild(group);
+					clmRun = { group, revision: removedBy.id, messages: [] };
+				}
+			}
+			if (clmRun && removedBy) clmRun.messages.push(message);
 			// Assistant messages need special handling for tool calls
 			if (message.role === "assistant") {
 				const timeline = splitAssistantMessageToolTimeline(message);
-				this.ctx.addMessageToChat(message, { reuseSettledComponent: options.reuseSettledComponents });
-				const lastChild = this.ctx.chatContainer.children[this.ctx.chatContainer.children.length - 1];
+				this.ctx.addMessageToChat(message, {
+					reuseSettledComponent: options.reuseSettledComponents,
+					appendTo: appendTranscript,
+				});
+				const children = (clmRun?.group ?? this.ctx.chatContainer).children;
+				const lastChild = children[children.length - 1];
 				const assistantComponent = lastChild instanceof AssistantMessageComponent ? lastChild : undefined;
 				if (assistantComponent) {
 					const usage = message.usage;
@@ -531,7 +603,7 @@ export class UiHelpers {
 						segment,
 						getAssistantMessageLinkTargets(this.ctx),
 					);
-					this.ctx.chatContainer.addChild(component);
+					appendTranscript(component);
 				};
 
 				// Render tool call components
@@ -555,7 +627,7 @@ export class UiHelpers {
 									showContentPreview: cfgReadToolResultPreview.get(this.ctx.settings),
 								});
 								readGroup.setExpanded(this.ctx.toolOutputExpanded);
-								this.ctx.chatContainer.addChild(readGroup);
+								appendTranscript(readGroup);
 							}
 							readGroup.updateArgs(content.arguments, content.id);
 							readGroup.updateResult(
@@ -569,7 +641,7 @@ export class UiHelpers {
 									showContentPreview: cfgReadToolResultPreview.get(this.ctx.settings),
 								});
 								readGroup.setExpanded(this.ctx.toolOutputExpanded);
-								this.ctx.chatContainer.addChild(readGroup);
+								appendTranscript(readGroup);
 							}
 							readGroup.updateArgs(content.arguments, content.id);
 							this.ctx.pendingTools.set(content.id, readGroup);
@@ -606,20 +678,28 @@ export class UiHelpers {
 								streamingStringKeys: streamingStringKeysForTool(renderToolName, rawInput),
 							})
 						: content.arguments;
-					const component = new ToolExecutionComponent(
-						renderToolName,
-						renderArgs,
-						{
-							useBuiltInRenderer: this.ctx.viewSession.hasBuiltInTool(renderToolName),
-							showImages: cfgTerminalShowImages.get(settings),
-						},
-						tool,
-						this.ctx.ui,
-						this.ctx.viewSession.sessionManager.getCwd(),
-						content.id,
-					);
-					component.setExpanded(this.ctx.toolOutputExpanded);
-					this.ctx.chatContainer.addChild(component);
+					const result = toolResults.get(content.id);
+					const cached =
+						options.reuseSettledComponents && !hasErrorStop && result
+							? this.ctx.transcriptMessageComponents.get(result)
+							: undefined;
+					const component =
+						cached instanceof ToolExecutionComponent
+							? cached
+							: new ToolExecutionComponent(
+									renderToolName,
+									renderArgs,
+									{
+										useBuiltInRenderer: this.ctx.viewSession.hasBuiltInTool(renderToolName),
+										showImages: cfgTerminalShowImages.get(settings),
+									},
+									tool,
+									this.ctx.ui,
+									this.ctx.viewSession.sessionManager.getCwd(),
+									content.id,
+								);
+					if (component !== cached) component.setExpanded(this.ctx.toolOutputExpanded);
+					appendTranscript(component);
 
 					if (hasErrorStop && errorMessage) {
 						component.updateResult(
@@ -639,9 +719,7 @@ export class UiHelpers {
 				// lines" transcript trap).
 				const strippedToolCalls = (message as AgentMessage & StrippedToolCallsMarker).strippedToolCalls ?? 0;
 				if (strippedToolCalls > 0) {
-					this.ctx.chatContainer.addChild(
-						new StrippedToolCallsPlaceholder(strippedToolCalls, !this.ctx.hideToolActivity),
-					);
+					appendTranscript(new StrippedToolCallsPlaceholder(strippedToolCalls, !this.ctx.hideToolActivity));
 				}
 				pendingUsage =
 					cfgDisplayShowTokenUsage.get(this.ctx.settings) && assistantUsageIsBilled(message.usage)
@@ -688,7 +766,7 @@ export class UiHelpers {
 								showContentPreview: cfgReadToolResultPreview.get(this.ctx.settings),
 							});
 							readGroup.setExpanded(this.ctx.toolOutputExpanded);
-							this.ctx.chatContainer.addChild(readGroup);
+							appendTranscript(readGroup);
 						}
 						const args = readToolCallArgs.get(message.toolCallId);
 						if (args) {
@@ -718,7 +796,19 @@ export class UiHelpers {
 					// snapshot. Keep the card partial, parked, and in `pendingTools` so
 					// the snapshot replay and later live progress frames land on it
 					// instead of hitting the no-pending-component early return (#10447).
-					component.updateResult(message, isBackgroundTask, message.toolCallId);
+					if (!options.reuseSettledComponents || this.ctx.transcriptMessageComponents.get(message) !== component) {
+						component.updateResult(message, isBackgroundTask, message.toolCallId);
+					}
+					// Cache only immutable ordinary results. Polls, todo panels and background snapshots
+					// have live displacement/progress ownership even when currently displayed as settled.
+					if (
+						component instanceof ToolExecutionComponent &&
+						message.toolName !== "wait" &&
+						message.toolName !== "todo" &&
+						asyncDetails?.state !== "running"
+					) {
+						this.ctx.transcriptMessageComponents.set(message, component);
+					}
 					if (isBackgroundTask) {
 						component.parkAsBackground();
 						backgroundTaskCallIds.add(message.toolCallId);
@@ -766,11 +856,23 @@ export class UiHelpers {
 				if (message.role === "custom" && isUserTurnInitiator(message as CustomMessage)) {
 					turnStartedAt = message.timestamp;
 				}
+				if (message.role === "custom" && message.customType === "clm_context_projection") {
+					this.#addClmRevision(message as CustomMessage<{ revision: string }>, clmHistory, clmArchive);
+					continue;
+				}
+				if (message.role === "custom" && message.customType === CLM_FEEDBACK_MESSAGE_TYPE) {
+					this.#addClmFeedback(message as CustomMessage<ClmFeedbackDetails | undefined>, appendTranscript);
+					continue;
+				}
 				// All other messages use standard rendering
-				this.ctx.addMessageToChat(message, { reuseSettledComponent: options.reuseSettledComponents });
+				this.ctx.addMessageToChat(message, {
+					reuseSettledComponent: options.reuseSettledComponents,
+					appendTo: appendTranscript,
+				});
 			}
 		}
 		flushPendingUsage();
+		closeClmRun();
 
 		// The trailing read run has no following break to close it; seal so the
 		// rebuilt group can retire as history even with a never-persisted result.
@@ -841,6 +943,103 @@ export class UiHelpers {
 	}
 
 	/**
+	 * A committed CLM revision at its transcript position: the `✎ Context edit` card for model
+	 * edits (or the plain receipt line when cards are off or for host revisions), then the notes
+	 * the edit added. Live commits rebuild the transcript, so live and reloaded sessions match.
+	 */
+	#addClmRevision(
+		marker: CustomMessage<{ revision: string }>,
+		history: ClmHistory | undefined,
+		archive: ClmArchive | undefined,
+	): void {
+		const revision = marker.details?.revision;
+		const entry = revision === undefined ? undefined : this.ctx.viewSession.sessionManager.getEntry(revision);
+		if (entry?.type !== "context_projection" || entry.cause === "diagnostics") return;
+		const change = entry.cause === "edit" ? history?.change(entry.id) : undefined;
+		if (change && archive && cfgCompactionClmShowContextEdits.get(this.ctx.settings) === "card") {
+			const rows = (messages: readonly AgentMessage[]): ClmContextEditRow[] =>
+				archive.idsFor(messages).flatMap(id => {
+					const item = archive.get(id);
+					return item ? [{ id, kind: item.toolName ?? item.kind, tokens: item.tokens, label: item.label }] : [];
+				});
+			const card = new ClmContextEditComponent({
+				state: "committed",
+				previousRevision: change.previousRevision,
+				revision: entry.id,
+				tokensBefore: entry.tokensBefore,
+				tokensAfter: entry.tokensAfter,
+				removed: rows(change.removed),
+				notes: rows(change.notes),
+				archiveItems: entry.archiveItems ?? archive.items.length,
+				archiveGrowth: entry.archiveGrowth,
+			});
+			card.setExpanded(this.ctx.toolOutputExpanded);
+			this.ctx.chatContainer.addChild(card);
+		} else {
+			// The receipt line the session showed live (`clm` notice source prefix included).
+			this.ctx.chatContainer.addChild(
+				new StatusNotice(
+					`clm: CLM committed ${entry.id} (${entry.cause}): estimated request ${entry.tokensBefore} → ${entry.tokensAfter} local tokens`,
+					text => theme.fg("dim", text),
+				),
+			);
+		}
+		for (const note of change?.notes ?? []) {
+			const card = new ClmNoteMessageComponent(note.content, entry.id);
+			card.setExpanded(this.ctx.toolOutputExpanded);
+			const removedBy = history?.removedBy(note);
+			if (removedBy) {
+				const ids = archive?.idsFor([note]) ?? [];
+				const group = new ClmRewrittenHistoryComponent({
+					revision: removedBy.id,
+					ids,
+					tokens: ids.reduce((sum, id) => sum + (archive?.get(id)?.tokens ?? 0), 0),
+				});
+				group.adopt(card);
+				group.close();
+				this.ctx.chatContainer.addChild(group);
+			} else {
+				this.ctx.chatContainer.addChild(card);
+			}
+		}
+	}
+
+	/**
+	 * The pressure chips and rejected receipts a journaled `clm-feedback` message showed live, at its
+	 * transcript position (its model-facing text stays hidden, `display: false`). A rejected receipt
+	 * renders as its card, or as the warning line live showed while edit cards are off.
+	 */
+	#addClmFeedback(
+		message: CustomMessage<ClmFeedbackDetails | undefined>,
+		append: (component: Component) => void,
+	): void {
+		const cards = cfgCompactionClmShowContextEdits.get(this.ctx.settings) === "card";
+		for (const activity of message.details?.activity ?? []) {
+			if (activity.type === "notice") {
+				const chip = new ClmNoticeComponent(activity.notice);
+				chip.setExpanded(this.ctx.toolOutputExpanded);
+				append(chip);
+				continue;
+			}
+			const receipt = activity.receipt;
+			if (receipt.kind !== "rejected") continue;
+			if (cards) {
+				const card = new ClmContextEditComponent({
+					state: "rejected",
+					transactionId: receipt.transactionId,
+					reason: receipt.reason,
+				});
+				card.setExpanded(this.ctx.toolOutputExpanded);
+				append(card);
+			} else if (receipt.message !== undefined) {
+				const block = new TranscriptBlock();
+				for (const line of warningLines(`clm: ${receipt.message}`)) block.addChild(line);
+				append(block);
+			}
+		}
+	}
+
+	/**
 	 * Fast-path history rewind (esc-esc branch, /tree rewind to an ancestor):
 	 * drop the rendered components at/after `message` in place instead of the
 	 * destructive clear-scrollback replay. Rows already committed to native
@@ -864,6 +1063,9 @@ export class UiHelpers {
 			return false;
 		}
 		const chat = this.ctx.chatContainer;
+		// Rewinding across a CLM revision can restore earlier dimmed messages. A suffix-only
+		// truncation cannot update those surviving groups; replay their effective state instead.
+		if (chat.children.some(child => child instanceof ClmRewrittenHistoryComponent)) return false;
 		const cut = this.ctx.transcriptMessageComponents.get(message);
 		if (!cut) return false;
 		const index = chat.children.indexOf(cut);
@@ -1067,8 +1269,7 @@ export class UiHelpers {
 	}
 
 	showWarning(warningMessage: string, options?: { hideWithToolActivity?: boolean }): void {
-		const text = new Text(`Warning: ${warningMessage}`, 1, 0).setStyleFn(t => theme.fg("warning", t));
-		const content = [new Spacer(1), text];
+		const content = warningLines(warningMessage);
 		this.ctx.present(options?.hideWithToolActivity ? new ToolActivityContainer(content) : content);
 	}
 

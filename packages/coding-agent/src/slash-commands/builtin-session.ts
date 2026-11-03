@@ -12,6 +12,7 @@ import {
 } from "../utils/changelog";
 import { formatTokenCount, refreshStatusLine } from "./builtin-modes";
 import { buildContextReportText } from "./helpers/context-report";
+import { runContextCommand } from "./helpers/clm-context";
 import { formatCoarseDuration } from "@oh-my-pi/pi-tui/chrome/format";
 import { sanitizeText } from "@oh-my-pi/pi-utils";
 import { handleMcpAcp } from "./helpers/mcp";
@@ -515,19 +516,28 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 	{
 		name: "context",
 		icon: "context",
-		description: "Show estimated context usage breakdown",
-		acpDescription: "Show context usage",
+		description: "Inspect context usage and experimental CLM revisions",
+		acpDescription: "Inspect context and restore CLM revisions",
+		allowArgs: true,
+		subcommands: [
+			{ name: "status", description: "Show effective revision, staged edit, and context estimates" },
+			{ name: "show", description: "Show the effective context document" },
+			{ name: "history", description: "List context revisions" },
+			{ name: "diff", description: "Compare a revision with effective context", usage: "REV" },
+			{ name: "restore", description: "Restore a revision as a new revision while idle", usage: "REV" },
+		],
 		getTuiAutocompleteDescription: runtime => {
 			const usage = runtime.ctx.session.getContextUsage();
 			if (!usage) return "Context: unavailable";
 			return `Context: ${Math.round(usage.percent)}% (${formatTokenCount(usage.tokens)}/${formatTokenCount(usage.contextWindow)})`;
 		},
-		handle: async (_command, runtime) => {
-			await runtime.output(buildContextReportText(runtime));
+		handle: async (command, runtime) => {
+			await runtime.output(await runContextCommand(runtime.session, command.args));
+			if (!command.args) await runtime.output(buildContextReportText(runtime));
 			return commandConsumed();
 		},
-		handleTui: (_command, runtime) => {
-			runtime.ctx.handleContextCommand();
+		handleTui: async (command, runtime) => {
+			await runtime.ctx.handleContextCommand(command.args);
 			clearSubmittedText(runtime);
 		},
 	},

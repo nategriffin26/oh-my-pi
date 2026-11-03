@@ -22,6 +22,7 @@ import { loadSkills, type Skill } from "./extensibility/skills";
 import { InternalUrlRouter } from "./internal-urls/router";
 import type { SchemeHost } from "./internal-urls/types";
 import activeRepoContextTemplate from "./prompts/system/active-repo-context.md" with { type: "text" };
+import clmContextManagementPrompt from "./prompts/system/clm-context-management.md" with { type: "text" };
 import customSystemPromptTemplate from "./prompts/system/custom-system-prompt.md" with { type: "text" };
 import defaultPersonality from "./prompts/system/personalities/default.md" with { type: "text" };
 import friendlyPersonality from "./prompts/system/personalities/friendly.md" with { type: "text" };
@@ -41,7 +42,7 @@ import { cfgEvalAutoBackgroundEnabled } from "./eval/settings";
 import { cfgTtsrBuiltinRules, cfgTtsrDisabledRules, cfgTtsrEnabled } from "./export/ttsr-settings";
 import { cfgTuiReactions, cfgTuiRenderMermaid } from "./modes/settings";
 import { cfgSecretsEnabled } from "./secrets/settings";
-import { cfgToolsFormat } from "./session/context-settings";
+import { cfgCompactionExperimentalClm, cfgToolsFormat } from "./session/context-settings";
 import {
 	cfgIncludeModelInPrompt,
 	cfgIncludeWorkspaceTree,
@@ -87,6 +88,7 @@ export const cfgSystemPromptInputs = combine({
 	ttsrBuiltinRules: cfgTtsrBuiltinRules,
 	ttsrDisabledRules: cfgTtsrDisabledRules,
 	secretsEnabled: cfgSecretsEnabled,
+	clmEnabled: cfgCompactionExperimentalClm,
 });
 
 /** Bundled personality specs, keyed by the `personality` setting value. */
@@ -559,6 +561,8 @@ export interface BuildSystemPromptOptions {
 	securityEnabled?: boolean;
 	/** Whether the user approves `cfg://` writes for this session; gates advertising `cfg://`. */
 	settingsApproval?: boolean;
+	/** Advertise the owning session's experimental context editor. */
+	clmEnabled?: boolean;
 	/**
 	 * Eval preludes advertised by this prompt. Each prelude's `guidance` is
 	 * appended as its own block after the rendered template, so custom templates
@@ -658,6 +662,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		memoryBackend,
 		securityEnabled = false,
 		settingsApproval = false,
+		clmEnabled = false,
 		evalPreludes = [],
 		model,
 		includeModelInPrompt = true,
@@ -933,6 +938,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		memoryBackend,
 		securityEnabled,
 		settingsApproval,
+		clmEnabled,
 	};
 	const filteredSkills = (options.skillDescriptions ?? new SkillDescriptionCatalog()).render(
 		hasSkillReader ? skills.filter(skill => skill.hide !== true) : [],
@@ -1016,6 +1022,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		rendered = prompt.render(systemPromptTemplate, data);
 	}
 	const systemPrompt = [rendered];
+	if (clmEnabled) systemPrompt.push(clmContextManagementPrompt.trim());
 	for (const prelude of evalPreludes) {
 		const guidance = prelude.guidance?.trim();
 		if (guidance) systemPrompt.push(guidance);

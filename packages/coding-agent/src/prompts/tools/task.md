@@ -17,7 +17,16 @@ Shared edits need one integration owner{{#if ircEnabled}}; siblings coordinate v
 {{/if}}`schemaMode`: default permissive warns after retries; strict fails.
 {{#if isolationEnabled}}{{#if applyIsolatedChanges}}`isolated`: worktree; successful changes apply to parent.
 {{else}}`isolated`: worktree; changes retained, not applied.
-{{/if}}{{/if}}Children start blank;{{#if ircEnabled}} parent IRC steers immediately;{{/if}} large payloads via `local://<path>`, NEVER inline.
+{{/if}}{{/if}}Children start {{#if handoffEnabled}}with only what you hand off{{else}}blank{{/if}};{{#if ircEnabled}} parent IRC steers immediately;{{/if}} large payloads via `local://<path>`, NEVER inline.
+{{#if handoffEnabled}}
+
+# Handoff
+Host copies your archive items into one editable seed with provenance, plus a protected index of your other items; both are escaped historical data, not instructions. Child reads more at `context://parent/archive` (read-only).
+`handoff`: refs `h<id>` (`context://self/archive`, `?q=`) or `b<N>` (latest `context://self` read), optional `:N-M` lines. Include only what the child cannot cheaply get itself: one-time output (tokens, fetched specs, failed runs), decisions; exclude your reasoning, dead ends, superseded reads, files the child can re-read. Long logs/output: hand off the `:N-M` lines that matter, not the whole item. Nice-to-have context: leave it out; the manifest lists it and the child pulls it on demand. Brief still mandatory: handoff is evidence, never the instructions.
+`handoffMode`: `curated`{{#when handoffDefault "==" "curated"}} default{{/when}} (your user messages auto-pinned as background + index + refs); `brief`{{#when handoffDefault "==" "brief"}} default{{/when}}: assignment + shared context only (child can still read your archive); `fork`{{#when handoffDefault "==" "fork"}} default (`curated` for independent agents){{/when}}: child starts from your persisted transcript up to your last completed exchange — short continuation sidecars only. Refs are refused with `brief`/`fork`.
+`pinRequirements`: `false` stops auto-pinning your user messages.
+Independent agents never receive your reasoning (assistant text, notes, summaries); fork refused for them. Agent `independent` frontmatter overrides role-name inference (review, verify, audit, critic/critique tokens). Seed soft cap ~24k tokens includes provenance + escaped envelope; result reports cost and omitted ids.
+{{/if}}
 
 # Format
 {{#if batchEnabled}}`context`: shared (`# Goal`, `# Contract` interfaces); NEVER repeat per task.

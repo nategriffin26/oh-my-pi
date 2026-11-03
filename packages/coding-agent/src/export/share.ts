@@ -142,6 +142,9 @@ function collectShareRegexSecretValues(o: SecretObfuscator, data: SessionData): 
 	};
 	const addMessage = (message: AgentMessage): void => {
 		switch (message.role) {
+			case "clmNote":
+				add(message.content);
+				return;
 			case "user":
 			case "developer":
 			case "custom":
@@ -295,6 +298,15 @@ function redactShareEntry(
 	sharedRegexSecretValues: ReadonlySet<string>,
 ): SessionEntry {
 	switch (entry.type) {
+		case "context_projection":
+			return {
+				type: "custom",
+				id: entry.id,
+				parentId: entry.parentId,
+				timestamp: entry.timestamp,
+				customType: "clm_context_projection",
+				data: undefined,
+			};
 		case "message":
 			return { ...entry, message: redactShareMessage(o, entry.message, sharedRegexSecretValues) };
 		case "compaction":
@@ -383,6 +395,8 @@ function redactShareMessage(
 	sharedRegexSecretValues: ReadonlySet<string>,
 ): AgentMessage {
 	switch (message.role) {
+		case "clmNote":
+			return { ...message, content: o.obfuscate(message.content, sharedRegexSecretValues) };
 		case "user":
 		case "developer":
 			return {

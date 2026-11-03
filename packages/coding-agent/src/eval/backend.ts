@@ -1,3 +1,4 @@
+import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import { buildEvalUrlRoots, LocalProtocolHandler } from "../internal-urls";
 import { contextLocalProtocolOptions } from "../internal-urls/context";
 import type { OutputArtifactError } from "@oh-my-pi/pi-tui/tools/streaming-output";
@@ -14,6 +15,7 @@ export interface ExecutorBackendExecOptions {
 	kernelOwnerId: string | undefined;
 	signal?: AbortSignal;
 	session: ToolSession;
+	toolContext?: AgentToolContext;
 	/**
 	 * Runtime-work budget in milliseconds (the cell's `timeout`). Cancellation is
 	 * driven entirely by `signal`, which the eval tool arms as a watchdog that

@@ -302,6 +302,8 @@ export interface ParsedAgentFields {
 	prewalk?: boolean | string;
 	/** `true` = advise with the default advisor-role model; string = advise with that model pattern. */
 	advisor?: boolean | string;
+	/** `true` = independent reviewer/verifier: parent handoffs exclude parent reasoning. */
+	independent?: boolean;
 }
 
 /**
@@ -367,6 +369,7 @@ export function parseAgentFields(frontmatter: Record<string, unknown>): ParsedAg
 	const model = parseModelList(frontmatter.model);
 	const blocking = parseBoolean(frontmatter.blocking);
 	const readSummarize = parseBoolean(frontmatter.readSummarize);
+	const independent = parseBoolean(frontmatter.independent);
 	// prewalk: true → hand off to the default prewalk target; "<pattern>" → custom target.
 	let prewalk: boolean | string | undefined = parseBoolean(frontmatter.prewalk);
 	if (prewalk === undefined && typeof frontmatter.prewalk === "string") {
@@ -395,6 +398,7 @@ export function parseAgentFields(frontmatter: Record<string, unknown>): ParsedAg
 		readSummarize,
 		prewalk,
 		advisor,
+		independent,
 	};
 }
 

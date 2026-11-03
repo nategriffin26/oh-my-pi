@@ -1,3 +1,4 @@
+import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
 import * as fs from "node:fs";
 
 import { getProjectDir, logger, Snowflake } from "@oh-my-pi/pi-utils";
@@ -58,6 +59,7 @@ export interface PythonToolInvokeOptions {
 }
 
 export interface PythonExecutorOptions {
+	toolContext?: AgentToolContext;
 	/** Working directory for command execution */
 	cwd?: string;
 	/** Source filename for file-backed execution and tracebacks. */

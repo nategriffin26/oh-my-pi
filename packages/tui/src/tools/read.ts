@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { parseArchivePathCandidates } from "@oh-my-pi/pi-utils/ar";
 import type { Component } from "../tui";
 import { Text } from "../components/text";
+import { wrapTextWithAnsi } from "../utils";
 import type {
 	NativeToolHead,
 	NativeToolView,
@@ -38,6 +39,7 @@ import type { OutputMeta } from "./output-meta";
 import type { TruncationResult } from "./streaming-output";
 import { describeProcRead, renderProcRead, type ProcReadDetails } from "./proc-render";
 import { describeCfgRead, renderCfgRead, type CfgReadDetails } from "./cfg-render";
+import { type ClmReadDetails, describeClmRead, renderClmRead } from "./clm-render";
 import type { CardToolResult } from "./result-card";
 import { type InternalUrlSchemeSpec, internalUrlSchemeSpec, splitUrlScheme } from "./url-scheme-host";
 
@@ -47,8 +49,12 @@ export type ReadTruncationStats = Omit<TruncationResult, "content">;
 /** Display metadata for file and URL reads. */
 export interface ReadToolDetails {
 	kind?: "file" | "url";
+	/** The captured display content is an explicit raw read, without summaries or elisions. */
+	raw?: boolean;
 	proc?: ProcReadDetails;
 	cfg?: CfgReadDetails;
+	/** Structured view of a `context://` (CLM) read; the card renders it instead of the model-facing text. */
+	clm?: ClmReadDetails;
 	/** Filesystem hyperlink target resolved by the executing tool. */
 	displayTarget?: string;
 	truncation?: ReadTruncationStats;
@@ -472,6 +478,28 @@ export const readToolRenderer = {
 		const routed = readUrlCard(baseRawPathForKind, result.details);
 		if (routed)
 			return routed.card.render(baseRawPathForKind, routed.target, result, result.details, options, uiTheme);
+		if (result.details?.clm && result.details.displayContent && !result.isError) {
+			const details = result.details;
+			const component = renderClmRead(
+				baseRawPathForKind,
+				stripOutputNotice(result.content?.find(c => c.type === "text")?.text ?? "", details.meta),
+				result.details.clm,
+				details.displayContent,
+				options,
+				uiTheme,
+			);
+			const warnings = (details.notes ?? []).map(note => uiTheme.fg("warning", note));
+			const truncationWarning = formatStyledTruncationWarning(details.meta, uiTheme);
+			if (truncationWarning) warnings.push(truncationWarning);
+			if (warnings.length === 0) return component;
+			return markFramedBlockComponent({
+				render: width => [
+					...component.render(width),
+					...warnings.flatMap(warning => wrapTextWithAnsi(warning, width)),
+				],
+				invalidate: () => component.invalidate?.(),
+			});
+		}
 		if (urlDetails?.kind === "url" || isReadableUrlPath(baseRawPathForKind)) {
 			return renderReadUrlResult(
 				result as {
@@ -665,6 +693,18 @@ export const readToolRenderer = {
 		const routed = readUrlCard(rawPath, details);
 		if (routed?.card.detailsKey === "proc") return describeProcRead(routed.target, result, details?.proc);
 		if (routed) return describeCfgRead(splitInternalUrlSel(rawPath).path, result, details?.cfg);
+		if (details?.clm && details.displayContent && !result.isError) {
+			const view = describeClmRead(
+				rawPath,
+				stripOutputNotice(resultText(result), details.meta),
+				details.clm,
+				details.displayContent,
+			);
+			return {
+				...view,
+				body: compact<NativeChild>([...(view.body ?? []), footnoteText(details.notes ?? [], details.meta)]),
+			};
+		}
 		if (details?.kind === "url" || isReadableUrlPath(rawPath)) {
 			return describeReadUrlResult({
 				content: result.content,

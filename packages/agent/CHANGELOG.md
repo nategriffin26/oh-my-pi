@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Changed
+
+- `convertMessageToLlm()` takes an optional CLM `rewriteAt`; empty CLM rewrite markers emit no provider message on their own. Added `isClmRewriteMarker()` and `clmRewriteCarry()` so array converters fold a marker's `historyRewriteAt` onto the following user message (or a minimal carrier before an assistant), and `defaultConvertToLlm()` applies it
+- CLM note bodies are XML-escaped inside the `<clm-note>` wrapper so model-authored text cannot close it
+
 ## [18.4.6] - 2026-10-01
 
 ### Added

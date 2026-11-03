@@ -8,6 +8,8 @@ import {
 } from "@oh-my-pi/pi-ai";
 import * as snapcompact from "@oh-my-pi/snapcompact";
 import { isRecord } from "@oh-my-pi/pi-utils";
+import { retireDiagnosticMessages } from "../lsp/diagnostic-state";
+import { getContextProjectionMessages, getLatestContextProjectionEntry, validateContextProjection } from "./clm-state";
 import {
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
@@ -139,6 +141,7 @@ export function getRestorableSessionModels(
 
 export function getLatestCompactionEntry(entries: SessionEntry[]): CompactionEntry | null {
 	for (let i = entries.length - 1; i >= 0; i--) {
+		if (entries[i].type === "context_projection" || entries[i].type === "reset_boundary") return null;
 		if (entries[i].type === "compaction") {
 			return entries[i] as CompactionEntry;
 		}
@@ -273,6 +276,24 @@ export function buildSessionContext(
 	}
 	path.reverse();
 
+	if (!options?.transcript) {
+		let projectionActive = false;
+		let unsafeCompaction = false;
+		for (const entry of path) {
+			if (entry.type === "context_projection") {
+				projectionActive = true;
+				unsafeCompaction = false;
+			} else if (entry.type === "reset_boundary") {
+				projectionActive = false;
+				unsafeCompaction = false;
+			} else if (entry.type === "compaction") unsafeCompaction = projectionActive;
+		}
+		if (unsafeCompaction)
+			throw new Error(
+				"Legacy compaction crosses a CLM projection; a compact projection is required for safe replay",
+			);
+	}
+
 	// Extract settings and find compaction
 	let thinkingLevel: string | undefined = "off";
 	let configuredThinkingLevel: string | undefined;
@@ -292,6 +313,7 @@ export function buildSessionContext(
 	let hasExplicitDefaultModel = false;
 
 	for (const entry of path) {
+		if (entry.type === "context_projection") validateContextProjection(entry);
 		if (entry.type === "thinking_level_change") {
 			thinkingLevel = entry.thinkingLevel ?? "off";
 			configuredThinkingLevel = entry.configured ?? entry.thinkingLevel ?? undefined;
@@ -335,6 +357,7 @@ export function buildSessionContext(
 	// after it (see the emission branch below); the full-history export path
 	// ignores it.
 	const resetBoundaryIdx = path.reduce((latest, entry, i) => (entry.type === "reset_boundary" ? i : latest), -1);
+	const projection = getLatestContextProjectionEntry(path);
 
 	// Build messages and collect corresponding entries
 	// When there's a compaction, we need to:
@@ -348,7 +371,7 @@ export function buildSessionContext(
 	let lastAssistantModel: string | undefined;
 
 	const handleEntryResetTracking = (entry: SessionEntry) => {
-		if (entry.type === "compaction") {
+		if (entry.type === "compaction" || entry.type === "context_projection") {
 			pendingReset = true;
 		} else if (entry.type === "model_change") {
 			pendingReset = true;
@@ -397,6 +420,16 @@ export function buildSessionContext(
 			}
 			const message = customMessageEntryMessage(entry);
 			if (message) pushMessage(message);
+		} else if (entry.type === "context_projection" && options?.transcript) {
+			pushMessage(
+				createCustomMessage(
+					"clm_context_projection",
+					"CLM context revision",
+					true,
+					{ revision: entry.id, cause: entry.cause },
+					entry.timestamp,
+				),
+			);
 		} else if (entry.type === "branch_summary" && entry.summary) {
 			pushMessage(createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp));
 		}
@@ -442,6 +475,19 @@ export function buildSessionContext(
 			} else {
 				appendMessage(entry);
 			}
+		}
+	} else if (projection && !options?.transcript) {
+		const projectionIdx = path.findIndex(entry => entry.id === projection.id);
+		const coveredIdx =
+			projection.coveredThroughEntryId === null
+				? -1
+				: path.findIndex(entry => entry.id === projection.coveredThroughEntryId);
+		if (projection.coveredThroughEntryId !== null && (coveredIdx < 0 || coveredIdx >= projectionIdx)) {
+			throw new Error("CLM coverage boundary is missing from the selected branch");
+		}
+		for (const message of getContextProjectionMessages(projection)) pushMessage(message);
+		for (let i = coveredIdx + 1; i < path.length; i++) {
+			if (i !== projectionIdx) appendMessage(path[i]);
 		}
 	} else if (
 		resetBoundaryIdx >= 0 &&
@@ -612,8 +658,9 @@ export function buildSessionContext(
 	}
 
 	if (!options?.transcript) {
-		const notes = getContextNotes(path);
-		const renderedNotes = renderContextNotes(path);
+		const notesPath = projection ? path.slice(path.findIndex(entry => entry.id === projection.id) + 1) : path;
+		const notes = getContextNotes(notesPath);
+		const renderedNotes = renderContextNotes(notesPath);
 		if (notes && renderedNotes.length > 0) {
 			const sourceEntry = path.find(entry => entry.id === notes.entryId);
 			if (sourceEntry) {
@@ -737,7 +784,7 @@ export function buildSessionContext(
 	}
 
 	return {
-		messages,
+		messages: options?.transcript ? messages : retireDiagnosticMessages(messages, entries),
 		cacheMissExplainedAt: options?.transcript ? cacheMissExplainedAt : undefined,
 		thinkingLevel,
 		configuredThinkingLevel,

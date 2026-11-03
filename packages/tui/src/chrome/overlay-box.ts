@@ -85,6 +85,17 @@ export function topBorderSplit(width: number, title: string, sidebarWidth: numbe
 	return left + paint(box.teeDown + box.horizontal.repeat(rightLen) + box.topRight);
 }
 
+/** Section rule that opens a sidebar column with a `┬` under the divider. */
+export function dividerOpenSplit(width: number, sidebarWidth: number): string {
+	const box = theme.boxRound;
+	const dividerCol = splitDividerCol(sidebarWidth);
+	const leftLen = Math.max(0, dividerCol - 1);
+	const rightLen = Math.max(0, width - 2 - dividerCol);
+	return paint(
+		box.teeRight + box.horizontal.repeat(leftLen) + box.teeDown + box.horizontal.repeat(rightLen) + box.teeLeft,
+	);
+}
+
 /** Section rule that closes the sidebar column with a `┴` over the divider. */
 export function dividerSplit(width: number, sidebarWidth: number): string {
 	const box = theme.boxRound;

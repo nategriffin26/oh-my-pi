@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { Agent, type AgentMessage } from "@oh-my-pi/pi-agent-core";
 import * as compactionModule from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantMessage, Model, UserMessage } from "@oh-my-pi/pi-ai";
+import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -13,7 +14,10 @@ import { SessionMaintenance, type SessionMaintenanceHost } from "@oh-my-pi/pi-co
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import * as snapcompactModule from "@oh-my-pi/snapcompact";
 
-import { cfgCompactionMethodOrder } from "@oh-my-pi/pi-coding-agent/session/context-settings";
+import {
+	cfgCompactionAutoContinue,
+	cfgCompactionMethodOrder,
+} from "@oh-my-pi/pi-coding-agent/session/context-settings";
 
 const CONTEXT_WINDOW = 100_000;
 const THRESHOLD = 50_000;
@@ -68,6 +72,7 @@ describe("async speculative compaction", () => {
 			asyncEnabled?: boolean;
 			methodOrder?: CompactionMethod[];
 			experimental?: boolean;
+			hostOverrides?: Partial<SessionMaintenanceHost>;
 			recoveryTools?: boolean;
 			obfuscateTextForProvider?: (text: string | undefined) => string | undefined;
 			obfuscatePreparationForProvider?: <T>(preparation: T) => T;
@@ -154,6 +159,7 @@ describe("async speculative compaction", () => {
 			setModelTemporary: async () => {},
 			abort: async () => {},
 			abortHandoff: () => {},
+			...options.hostOverrides,
 		} as unknown as SessionMaintenanceHost;
 		return new SessionMaintenance(host);
 	}
@@ -960,5 +966,183 @@ describe("async speculative compaction", () => {
 		expect(entry?.type === "compaction" ? entry.tokensAfter : undefined).toBe(
 			agent.tokenizer.countMessages(convertToLlm(agent.state.messages), { excludeEncryptedReasoning: true }),
 		);
+	});
+
+	describe("CLM maintenance authority", () => {
+		function publishProjection(messages: AgentMessage[]): void {
+			sessionManager.appendContextProjection({
+				coveredThroughEntryId: sessionManager.getLeafId(),
+				messages,
+				rewriteAt: Date.now(),
+				tokensBefore: 100_000,
+				tokensAfter: 100,
+				cause: "edit",
+			});
+			agent.replaceMessages(sessionManager.buildSessionContext().messages);
+		}
+
+		for (const enabled of [true, false]) {
+			it("blocks automatic rewrites and recovery with CLM flag " + enabled, async () => {
+				maintenance = createMaintenance({ experimental: true, hostOverrides: { clmEnabled: () => enabled } });
+				if (!enabled) publishProjection([userMessage("current effective task")]);
+				else agent.replaceMessages([userMessage("current effective task")]);
+				const history = structuredClone(sessionManager.getBranch());
+				const effective = structuredClone(agent.state.messages);
+				const failure = assistantMessage("", model);
+				failure.stopReason = "error";
+				failure.errorMessage = "context window exceeded";
+				await maintenance.runPrePromptCompactionIfNeeded([userMessage("oversized ".repeat(50_000))]);
+				await maintenance.maintainContextMidRun(agent.state.messages, undefined, {
+					message: failure,
+					toolResults: [],
+					willContinue: true,
+				});
+				await maintenance.runIdleCompaction();
+				for (const reason of ["threshold", "overflow", "incomplete", "idle"] as const) {
+					await maintenance.runAutoCompaction(reason, true, false, false, { explicitNewContextRequest: true });
+				}
+				expect(await maintenance.shakeForRequestBodyReadTimeout(0)).toBe(false);
+				expect((await maintenance.checkCompaction(failure)).automaticContinuationBlocked).toBe(true);
+				failure.stopReason = "length";
+				expect((await maintenance.checkCompaction(failure)).automaticContinuationBlocked).toBe(true);
+				await maintenance.checkCompaction(assistantMessage("normal answer", model));
+				maintenance.maybeStartSpeculativeCompaction(SPECULATION_BAND_START, CONTEXT_WINDOW);
+				expect(maintenance.deferThresholdCompactionToSpeculation(THRESHOLD, CONTEXT_WINDOW)).toBe(false);
+				expect(sessionManager.getBranch()).toEqual(history);
+				expect(agent.state.messages).toEqual(effective);
+				expect(events).toEqual([]);
+			});
+		}
+
+		it("rejects unsupported destructive manual operations after disabling CLM", async () => {
+			maintenance = createMaintenance({ hostOverrides: { clmEnabled: () => false } });
+			publishProjection([userMessage("effective task")]);
+			const history = structuredClone(sessionManager.getBranch());
+			await expect(maintenance.dropImages()).rejects.toThrow("cannot rewrite CLM context");
+			for (const mode of ["images", "thinking", "elide"] as const) {
+				await expect(maintenance.shake(mode)).rejects.toThrow("cannot rewrite CLM context");
+			}
+			await expect(maintenance.handoff()).rejects.toThrow("cannot rewrite CLM context");
+			for (const mode of ["remote", "snapcompact"] as const) {
+				await expect(maintenance.compact(undefined, { mode })).rejects.toThrow("only readable /compact");
+			}
+			expect(sessionManager.getBranch()).toEqual(history);
+		});
+
+		it("cancels an armed legacy speculation when CLM activates", async () => {
+			let enabled = false;
+			maintenance = createMaintenance({ hostOverrides: { clmEnabled: () => enabled } });
+			vi.spyOn(compactionModule, "compact").mockImplementation(async preparation => ({
+				summary: "legacy summary",
+				firstKeptEntryId: preparation.firstKeptEntryId,
+				tokensBefore: preparation.tokensBefore,
+				details: {},
+			}));
+			maintenance.maybeStartSpeculativeCompaction(SPECULATION_BAND_START, CONTEXT_WINDOW);
+			await waitForState("armed");
+			const history = structuredClone(sessionManager.getBranch());
+			enabled = true;
+			maintenance.maybeStartSpeculativeCompaction(SPECULATION_BAND_START, CONTEXT_WINDOW);
+			expect(maintenance.speculationState).toBe("idle");
+			await maintenance.runAutoCompaction("threshold", false);
+			expect(sessionManager.getBranch()).toEqual(history);
+		});
+
+		it("summarizes only effective context, retains task authority, and never resumes an interrupted CLM turn", async () => {
+			const prompts: string[] = [];
+			const lifecycle: string[] = [];
+			maintenance = createMaintenance({
+				methodOrder: ["remote"],
+				hostOverrides: {
+					clmEnabled: () => false,
+					convertToLlmForSideRequest: convertToLlm,
+					sideStreamFn: (_model, context) => {
+						prompts.push(JSON.stringify(context));
+						const stream = new AssistantMessageEventStream();
+						stream.push({
+							type: "done",
+							reason: "stop",
+							message: assistantMessage("Readable rescue summary", model),
+						});
+						return stream;
+					},
+					commitClmContext: async (messages, cause, source) => {
+						expect(source).toEqual(agent.state.messages);
+						sessionManager.appendContextProjection({
+							previousRevisionId: sessionManager.getLatestContextProjection()?.id,
+							coveredThroughEntryId: sessionManager.getLeafId(),
+							messages,
+							rewriteAt: Date.now(),
+							tokensBefore: 100,
+							tokensAfter: 50,
+							cause,
+						});
+						agent.replaceMessages(sessionManager.buildSessionContext().messages);
+					},
+					disconnectFromAgent: () => lifecycle.push("disconnect"),
+					abort: async () => {
+						lifecycle.push("abort");
+						agent.state.isStreaming = false;
+					},
+					reconnectToAgent: () => lifecycle.push("reconnect"),
+					drainStrandedQueuedMessages: () => lifecycle.push("drain"),
+					scheduleAgentContinue: () => lifecycle.push("continue"),
+				},
+			});
+			const developer: AgentMessage = { role: "developer", content: "Preserve exact policy", timestamp: Date.now() };
+			const currentUser = userMessage("Current user request");
+			publishProjection([
+				developer,
+				userMessage("prior effective task"),
+				{ role: "clmNote", content: "Effective decision: use blue", timestamp: Date.now() },
+				currentUser,
+			]);
+			cfgCompactionAutoContinue.override(maintenanceSettings, true);
+			agent.state.isStreaming = true;
+			const result = await maintenance.compact("Preserve decisions");
+			expect(result.summary).toContain("Readable rescue summary");
+			expect(prompts.join("\n")).toContain("Effective decision: use blue");
+			expect(prompts.join("\n")).not.toContain("conversation conversation");
+			expect(agent.state.messages).toContainEqual(developer);
+			expect(agent.state.messages).toContainEqual(currentUser);
+			expect(
+				agent.state.messages.some(
+					message =>
+						message.role === "compactionSummary" &&
+						message.summary.includes("Readable rescue summary") &&
+						!message.providerPayload,
+				),
+			).toBe(true);
+			expect(sessionManager.getLatestContextProjection()?.cause).toBe("compact");
+			expect(lifecycle).toEqual(["disconnect", "abort", "reconnect", "drain"]);
+			expect(maintenance.isCompacting).toBe(false);
+		});
+
+		it("visibly refuses opaque native rebase without expanding raw history and still cleans up", async () => {
+			const lifecycle: string[] = [];
+			maintenance = createMaintenance({
+				hostOverrides: {
+					clmEnabled: () => true,
+					commitClmContext: async () => {
+						throw new Error("must not commit");
+					},
+					reconnectToAgent: () => lifecycle.push("reconnect"),
+					scheduleAgentContinue: () => lifecycle.push("continue"),
+				},
+			});
+			sessionManager.appendCompaction("opaque native boundary", undefined, "", 100_000, {
+				preserveData: {
+					anthropicCompaction: { provider: "anthropic", content: "opaque native boundary", signature: "signed" },
+				},
+			});
+			agent.replaceMessages(sessionManager.buildSessionContext().messages);
+			const history = structuredClone(sessionManager.getBranch());
+			const effective = structuredClone(agent.state.messages);
+			await expect(maintenance.compact()).rejects.toThrow("Cannot faithfully summarize");
+			expect(sessionManager.getBranch()).toEqual(history);
+			expect(agent.state.messages).toEqual(effective);
+			expect(lifecycle).toEqual(["reconnect"]);
+			expect(maintenance.isCompacting).toBe(false);
+		});
 	});
 });

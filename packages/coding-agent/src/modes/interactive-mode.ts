@@ -219,6 +219,7 @@ import {
 	VibeSessionRegistry,
 } from "../vibe/runtime";
 import { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
+import { transcriptBlocks } from "@oh-my-pi/pi-tui/chat/clm-rewritten-history";
 import { setTranscriptActionHandler } from "@oh-my-pi/pi-tui/chat/transcript-actions";
 import { StatusNotice } from "@oh-my-pi/pi-tui/chrome/status-notice";
 import { ReadToolGroupComponent } from "@oh-my-pi/pi-tui/chat/read-tool-group";
@@ -1882,7 +1883,7 @@ export class InteractiveMode implements InteractiveModeContext {
 					this.showModelSelector({ temporaryOnly: true });
 					return;
 				case "status.context":
-					this.handleContextCommand();
+					void this.handleContextCommand();
 					return;
 				case "status.git":
 					this.showGitUi();
@@ -3467,7 +3468,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (any("display.hideToolActivity") && hideToolActivity !== this.hideToolActivity) {
 			this.hideToolActivity = hideToolActivity;
 			if (!hideToolActivity) this.toolOutputExpanded = false;
-			for (const child of this.chatContainer.children) {
+			for (const child of transcriptBlocks(this.chatContainer.children)) {
 				if (
 					!hideToolActivity &&
 					(child instanceof ToolExecutionComponent || child instanceof ReadToolGroupComponent)
@@ -3484,7 +3485,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 		if (any("terminal.showImages")) {
 			const visible = cfgTerminalShowImages.get(this.settings);
-			for (const child of this.chatContainer.children) {
+			for (const child of transcriptBlocks(this.chatContainer.children)) {
 				if (child instanceof ToolExecutionComponent) {
 					child.setShowImages(visible);
 				} else if (child instanceof AssistantMessageComponent) {
@@ -3497,7 +3498,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		const hideThinkingBlock = cfgHideThinkingBlock.get(this.settings);
 		if (any("hideThinkingBlock") && hideThinkingBlock !== this.hideThinkingBlock) {
 			this.hideThinkingBlock = hideThinkingBlock;
-			for (const child of this.chatContainer.children) {
+			for (const child of transcriptBlocks(this.chatContainer.children)) {
 				if (child instanceof AssistantMessageComponent) child.setHideThinkingBlock(this.effectiveHideThinkingBlock);
 			}
 			this.ui.requestRender(true);
@@ -3505,7 +3506,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		const proseOnlyThinking = cfgProseOnlyThinking.get(this.settings);
 		if (any("proseOnlyThinking") && proseOnlyThinking !== this.proseOnlyThinking) {
 			this.proseOnlyThinking = proseOnlyThinking;
-			for (const child of this.chatContainer.children) {
+			for (const child of transcriptBlocks(this.chatContainer.children)) {
 				if (child instanceof AssistantMessageComponent) child.setProseOnlyThinking(proseOnlyThinking);
 			}
 			this.ui.requestRender(true);
@@ -7502,6 +7503,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		options?: {
 			imageLinks?: readonly (string | undefined)[];
 			reuseSettledComponent?: boolean;
+			appendTo?: (component: Component) => void;
 		},
 	): Component[] {
 		return this.#uiHelpers.addMessageToChat(message, options);
@@ -7636,8 +7638,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#commandController.handleToolsCommand();
 	}
 
-	handleContextCommand(): void {
-		this.#commandController.handleContextCommand();
+	handleContextCommand(args?: string): Promise<void> {
+		return this.#commandController.handleContextCommand(args);
 	}
 
 	#vibeSessionTransitionBlocked(): boolean {

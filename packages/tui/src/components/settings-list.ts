@@ -54,6 +54,8 @@ export interface SettingItem {
 	defaultLabel?: string;
 	/** Render as a non-interactive section heading. Skipped by navigation and search. */
 	heading?: boolean;
+	/** Listed and editable, but without effect until the setting it depends on is enabled; renders dim. */
+	inactive?: boolean;
 }
 
 /** A row's open editor as a native settings page shows it (`TspPrefsProps.editing`). */
@@ -699,7 +701,8 @@ export class SettingsList implements Component {
 	#describeItem(item: NativeDescribedSetting): NativeNode {
 		const value = plainLine(String(item.currentValue ?? ""));
 		const changed = item.changed === true;
-		const signature = `${item.heading === true}\0${item.label}\0${value}\0${changed}\0${item.warning ?? ""}\0${item.description ?? ""}`;
+		const inactive = item.inactive === true;
+		const signature = `${item.heading === true}\0${item.label}\0${value}\0${changed}\0${inactive}\0${item.warning ?? ""}\0${item.description ?? ""}`;
 		const cached = item[kNativeItem];
 		if (cached?.signature === signature) return cached.node;
 		let described: NativeNode;
@@ -711,7 +714,7 @@ export class SettingsList implements Component {
 				item.id,
 			);
 		} else {
-			const label: TspSpan[] = [span(plainLine(item.label), changed ? "accent" : undefined)];
+			const label: TspSpan[] = [span(plainLine(item.label), inactive ? "muted" : changed ? "accent" : undefined)];
 			if (item.warning && this.#theme.warningMark)
 				label.push(span(` ${plainText(this.#theme.warningMark)}`, "warning"));
 			const detail: TspSpan[] = [];
@@ -724,7 +727,7 @@ export class SettingsList implements Component {
 				"item",
 				{
 					label,
-					value: [span(value, changed ? "accent" : "muted")],
+					value: [span(value, changed && !inactive ? "accent" : "muted")],
 					detail: detail.length > 0 ? detail : undefined,
 				},
 				undefined,
@@ -776,12 +779,18 @@ export class SettingsList implements Component {
 		const valueMaxWidth = rowWidth - prefixWidth - maxLabelWidth - visibleWidth(separator) - 2;
 		const valuePlain = truncateToWidth(String(item.currentValue ?? ""), valueMaxWidth, Ellipsis.Omit);
 		const hovered = !isSelected && this.#theme.hovered !== undefined && item.id === this.#hoveredItemId;
-		// De-emphasized rows (outside the active section) render as plain text
-		// under one dim wash so inner label/value colors don't fight it.
-		if (dimmed && !isSelected) {
-			const text = this.#theme.hint(
-				truncateToWidth(`  ${labelPlain}${labelPad}${separator}${valuePlain}`, Math.max(0, rowWidth)),
-			);
+		// De-emphasized rows (outside the active section, or inactive settings)
+		// render as plain text under one dim wash so inner label/value colors
+		// don't fight it; a selected inactive row keeps only its cursor.
+		if ((dimmed && !isSelected) || item.inactive) {
+			const text =
+				prefix +
+				this.#theme.hint(
+					truncateToWidth(
+						`${labelPlain}${labelPad}${separator}${valuePlain}`,
+						Math.max(0, rowWidth - prefixWidth),
+					),
+				);
 			return hovered && this.#theme.hovered ? this.#theme.hovered(text) : text;
 		}
 		const warningStyle = this.#theme.warning ?? this.#theme.description;

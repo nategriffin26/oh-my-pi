@@ -1,5 +1,5 @@
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
-import { isTaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
+import { isTaskToolDetails, type TaskHandoffMode } from "@oh-my-pi/pi-tui/tools/task";
 import { taskSubprocessRenderer } from "@oh-my-pi/pi-tui/tools/subprocess";
 /**
  * Task tool - Delegate tasks to specialized agents.
@@ -41,6 +41,8 @@ import { hasWaitTool } from "../tools/wait";
 import { isIrcEnabled } from "../irc/messaging";
 import { isReadOnlyAgent } from "./read-only-policy";
 import { formatTaskResultSummary } from "./result-summary";
+import { formatHandoffCost, summarizeTaskHandoff, validateHandoffFields } from "./handoff";
+import { cfgCompactionClmHandoffDefault } from "../session/context-settings";
 import { isScoutSpawnable, resolveSpawnPolicy } from "./spawn-policy";
 import { type AgentDefinition, canSpawnAtDepth, getTaskSchema, type TaskToolSchemaInstance } from "./types";
 import {
@@ -148,6 +150,9 @@ interface TaskDescriptionOptions {
 	batchEnabled: boolean;
 	effortEnabled: boolean;
 	evalToolsEnabled: boolean;
+	handoffEnabled: boolean;
+	/** Mode a CLM parent's spawn takes when it names neither `handoffMode` nor refs. */
+	handoffDefault: TaskHandoffMode;
 	asyncEnabled: boolean;
 	ircEnabled: boolean;
 	parentSpawns: string;
@@ -183,6 +188,8 @@ function renderDescription(options: TaskDescriptionOptions): string {
 		batchEnabled: options.batchEnabled,
 		effortEnabled: options.effortEnabled,
 		evalToolsEnabled: options.evalToolsEnabled,
+		handoffEnabled: options.handoffEnabled,
+		handoffDefault: options.handoffDefault,
 		asyncEnabled: options.asyncEnabled,
 		hasBlockingAgents: renderedAgents.some(agent => agent.blocking),
 		hasModelMentions: options.sessionAgents.length > 0,
@@ -247,8 +254,9 @@ function validateSpawnParams(params: TaskParams, batchEnabled: boolean): string 
 			if (!item || typeof item.task !== "string" || item.task.trim() === "") {
 				return `Task ${i + 1}${item?.name ? ` (\`${item.name}\`)` : ""} is missing \`task\`. Every task needs complete, self-contained instructions.`;
 			}
-			const effortError = validateEffort(item.effort, `Task ${i + 1}${item.name ? ` (\`${item.name}\`)` : ""}`);
-			if (effortError) return effortError;
+			const label = `Task ${i + 1}${item.name ? ` (\`${item.name}\`)` : ""}`;
+			const fieldError = validateEffort(item.effort, label) ?? validateHandoffFields(item, label);
+			if (fieldError) return fieldError;
 		}
 		const seen = new Map<string, string>();
 		for (const item of tasks) {
@@ -271,7 +279,7 @@ function validateSpawnParams(params: TaskParams, batchEnabled: boolean): string 
 			? "Missing `tasks`. Provide a `tasks` array (one subagent per item) with a shared `context`."
 			: "Missing `task`. Provide complete, self-contained instructions for the agent.";
 	}
-	return validateEffort(params.effort, "The call");
+	return validateEffort(params.effort, "The call") ?? validateHandoffFields(params, "The call");
 }
 
 /**
@@ -291,6 +299,9 @@ function resolveSpawnItems(params: TaskParams): TaskItem[] {
 	if ("tools" in params) item.tools = params.tools;
 	if ("effort" in params) item.effort = params.effort;
 	if ("isolated" in params) item.isolated = params.isolated;
+	if ("handoff" in params) item.handoff = params.handoff;
+	if ("handoffMode" in params) item.handoffMode = params.handoffMode;
+	if ("pinRequirements" in params) item.pinRequirements = params.pinRequirements;
 	return [item];
 }
 
@@ -313,6 +324,9 @@ function spawnParamsFor(params: TaskParams, item: TaskItem, defaultAgent: string
 	if ("schemaMode" in item) spawn.schemaMode = item.schemaMode;
 	if ("tools" in item) spawn.tools = item.tools;
 	if ("effort" in item) spawn.effort = item.effort;
+	if ("handoff" in item) spawn.handoff = item.handoff;
+	if ("handoffMode" in item) spawn.handoffMode = item.handoffMode;
+	if ("pinRequirements" in item) spawn.pinRequirements = item.pinRequirements;
 	if (item.isolated !== undefined) {
 		spawn.isolated = item.isolated;
 	} else if ("isolated" in params) {
@@ -666,6 +680,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			batchEnabled: this.#isBatchEnabled(),
 			effortEnabled: cfgTaskEnableEffort.get(this.session.settings),
 			evalToolsEnabled: evalToolsEnabled(this.session),
+			handoffEnabled: this.session.clmContext?.isEnabled() === true,
 			defaultAgent: this.#defaultAgent(),
 		});
 	}
@@ -690,6 +705,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			batchEnabled: this.#isBatchEnabled(),
 			effortEnabled: cfgTaskEnableEffort.get(this.session.settings),
 			evalToolsEnabled: evalToolsEnabled(this.session),
+			handoffEnabled: this.session.clmContext?.isEnabled() === true,
+			handoffDefault: cfgCompactionClmHandoffDefault.get(this.session.settings),
 			asyncEnabled: cfgAsyncEnabled.get(this.session.settings),
 			ircEnabled: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
 			parentSpawns: this.session.getSessionSpawns() ?? "*",
@@ -802,6 +819,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			...(Object.hasOwn(params, "outputSchema") ? { outputSchema: params.outputSchema } : {}),
 			...(Object.hasOwn(params, "schemaMode") ? { schemaMode: params.schemaMode } : {}),
 			...(params.effort !== undefined ? { effort: params.effort } : {}),
+			handoff: { refs: params.handoff, mode: params.handoffMode, pinRequirements: params.pinRequirements },
 			...("isolated" in params ? { isolation: { requested: params.isolated } } : {}),
 			blockedAgent: this.#blockedAgent,
 			enableLsp: (this.session.enableLsp ?? true) && cfgTaskEnableLsp.get(this.session.settings),
@@ -894,6 +912,16 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		}
 		const policies = preflights.map(preflight => preflight.policy!);
 		const itemBlocking = policies.map(policy => policy.effectiveAgent.blocking === true);
+		// Parent-visible handoff cost per spawn (curated seed + manifest, or fork), shown with the spawn output.
+		const handoffCost = policies
+			.map((policy, index) =>
+				formatHandoffCost(
+					spawnItems[index]!.name?.trim() || `${resolvedAgents[index]} #${index + 1}`,
+					policy.handoff,
+				),
+			)
+			.filter(line => line !== undefined)
+			.join("\n");
 
 		// Execution mode is per item: an item whose agent type declares
 		// `blocking: true` runs inline on this turn (the parent waits on its
@@ -924,7 +952,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			if (asyncEnabled && !this.session.asyncJobManager) {
 				logger.warn("task: no AsyncJobManager registered; falling back to sync execution");
 			}
-			const advisory = this.session.suppressSpawnAdvisory
+			const spawnAdvisory = this.session.suppressSpawnAdvisory
 				? undefined
 				: composeSpawnAdvisory({
 						agents: resolvedAgents,
@@ -937,6 +965,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							this.session.getSessionSpawns?.() ?? "*",
 						),
 					});
+			const advisory = [handoffCost, spawnAdvisory].filter(Boolean).join("\n\n") || undefined;
 			const result = await this.#executeSyncFanout(
 				toolCallId,
 				params,
@@ -961,7 +990,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		// Coordination only makes sense for spawns that keep running after this
 		// call returns (the async subset). Blocking items have already completed
 		// by then, so a "coordinate while they run" hint would misfire.
-		const advisory = this.session.suppressSpawnAdvisory
+		const spawnAdvisory = this.session.suppressSpawnAdvisory
 			? undefined
 			: composeSpawnAdvisory({
 					agents: resolvedAgents,
@@ -974,6 +1003,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						this.session.getSessionSpawns?.() ?? "*",
 					),
 				});
+		const advisory = [handoffCost, spawnAdvisory].filter(Boolean).join("\n\n") || undefined;
 		// Returns a fresh result (copied content array, copied text part) rather
 		// than mutating the caller's — task results are short-lived here, but an
 		// in-place edit on a shared/cached AgentToolResult would be a hidden trap.
@@ -1020,6 +1050,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					agent: agentType,
 					agentSource,
 					modelRole: policy.modelRole,
+					handoff: summarizeTaskHandoff(policy.handoff),
 					status: "pending",
 					task: renderSubagentUserPrompt(assignment),
 					assignment,
@@ -1305,6 +1336,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							: undefined;
 						progress.advisor = nextProgress.advisor ?? progress.advisor;
 						progress.resolvedModelRoute = nextProgress.resolvedModelRoute ?? progress.resolvedModelRoute;
+						progress.handoff = nextProgress.handoff;
+						progress.inflightTaskDetails = nextProgress.inflightTaskDetails;
+						progress.extractedToolData = nextProgress.extractedToolData;
 						progress.tokens = nextProgress.tokens;
 						progress.requests = nextProgress.requests;
 						progress.contextTokens = nextProgress.contextTokens;
@@ -1393,6 +1427,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					progress.modelRole = singleResult?.modelRole ?? progress.modelRole;
 					progress.advisor = singleResult?.advisor ?? progress.advisor;
 					progress.resolvedModelRoute = singleResult?.resolvedModelRoute ?? progress.resolvedModelRoute;
+					if (singleResult) progress.handoff = singleResult.handoff;
 					if (singleResult?.resolvedModel) {
 						progress.resolvedModel = singleResult.resolvedModel;
 						progress.resolvedModelIdentity = singleResult.resolvedModelIdentity;
@@ -1611,6 +1646,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				...(Object.hasOwn(params, "schemaMode") ? { schemaMode: params.schemaMode } : {}),
 				...(params.effort !== undefined ? { effort: params.effort } : {}),
 				solutionSpace: params.solutionSpace,
+				handoff: { refs: params.handoff, mode: params.handoffMode, pinRequirements: params.pinRequirements },
 				...(params.tools?.length
 					? {
 							customTools: createEvalCustomTools(

@@ -195,6 +195,7 @@ function makeRenderCtx(
 			hasBuiltInTool: () => true,
 			extensionRunner: undefined,
 			sessionManager: {
+				getBranch: () => [],
 				getEntries: vi.fn(() => []),
 				getCwd: vi.fn(() => "/tmp"),
 				putBlobSync: vi.fn(() => ({

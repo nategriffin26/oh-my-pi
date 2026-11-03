@@ -23,6 +23,7 @@ import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { formatPathRelativeToCwd } from "./path-utils";
 import { type LineRange } from "@oh-my-pi/pi-tui/tools/line-ranges";
 import type { ReadToolDetails, ReadTruncationStats } from "@oh-my-pi/pi-tui/tools/read";
+import type { ClmBlockRow } from "@oh-my-pi/pi-tui/tools/clm-render";
 import { isRawSelector, type ParsedSelector, resolveTailSelector, selToOffsetLimit } from "./read-selector";
 import { formatBytes, shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
@@ -264,6 +265,26 @@ export interface InMemoryTextOptions {
 	immutable?: boolean;
 }
 
+/** Keep UI-only previews within the formatted page before persistence/export can observe them. */
+function selectClmDocumentRows(result: AgentToolResult<ReadToolDetails>): AgentToolResult<ReadToolDetails> {
+	const details = result.details;
+	if (!details) return result;
+	const clm = details.clm;
+	if (!clm || (clm.kind !== "document" && clm.kind !== "revision")) return result;
+	const display = details.displayContent;
+	const visibleLines = new Set(display?.lineNumbers?.filter((line): line is number => line !== null) ?? []);
+	const blocks: ClmBlockRow[] = [];
+	for (let index = 0; index < clm.blocks.length; index++) {
+		const block = clm.blocks[index];
+		const line = block.line ?? index + 2;
+		if (visibleLines.has(line)) blocks.push({ ...block, line });
+	}
+	return {
+		...result,
+		details: { ...details, clm: { ...clm, blockCount: clm.blockCount ?? clm.blocks.length, blocks } },
+	};
+}
+
 /**
  * Render any read selector against in-memory text. Pins `:-N` tails to the
  * text's own line count (raw mode addresses `\n` segments verbatim; otherwise
@@ -281,10 +302,10 @@ export function buildInMemorySelectorResult(
 	const totalLines = countSplitLines(text, raw);
 	const sel = resolveTailSelector(parsed, totalLines);
 	if (sel.kind === "lines" && sel.ranges.length > 1) {
-		return buildInMemoryMultiRangeResult(session, text, sel.ranges, { ...options, raw });
+		return selectClmDocumentRows(buildInMemoryMultiRangeResult(session, text, sel.ranges, { ...options, raw }));
 	}
 	const { offset, limit } = selToOffsetLimit(sel);
-	return buildInMemoryTextResult(session, text, offset, limit, { ...options, raw });
+	return selectClmDocumentRows(buildInMemoryTextResult(session, text, offset, limit, { ...options, raw }));
 }
 
 export function buildInMemoryTextResult(
@@ -296,6 +317,7 @@ export function buildInMemoryTextResult(
 ): AgentToolResult<ReadToolDetails> {
 	const displayMode = resolveFileDisplayMode(session, { raw: options.raw, immutable: options.immutable });
 	const details = options.details ?? {};
+	details.raw = options.raw === true;
 	const allLines = options.raw === true ? text.split("\n") : splitAddressableFileLines(text);
 	const totalLines = allLines.length;
 	details.totalLines = totalLines;
@@ -530,6 +552,14 @@ export function buildInMemoryMultiRangeResult(
 	let outputText = "";
 	if (options.raw === true) {
 		outputText = rawParts.length > 0 ? rawParts.join("\n\n…\n\n") : "";
+		if (visibleSpans.length > 0) {
+			const lineNumbers: Array<number | null> = [];
+			for (const span of visibleSpans) {
+				if (lineNumbers.length > 0) lineNumbers.push(null, null, null);
+				for (let line = span.startLine; line <= span.endLine; line++) lineNumbers.push(line);
+			}
+			details.displayContent = { text: outputText, startLine: visibleSpans[0].startLine, lineNumbers };
+		}
 	} else if (visibleSpans.length > 0) {
 		const entries = buildLineEntriesWithBlockContext(allLines, visibleSpans, { path: options.sourcePath, text });
 		if (shouldAddHashLines) seenLines = lineNumbersFromEntries(entries);
@@ -550,6 +580,7 @@ export function buildInMemoryMultiRangeResult(
 		const bound = range.endLine !== undefined ? `${range.startLine}-${range.endLine}` : `${range.startLine}`;
 		notices.push(`[Range ${bound} is beyond end of ${options.entityLabel} (${totalLines} lines total); skipped]`);
 	}
+	if (notices.length > 0) details.notes = [...(details.notes ?? []), ...notices];
 	const finalText =
 		notices.length > 0 ? (outputText ? `${outputText}\n${notices.join("\n")}` : notices.join("\n")) : outputText;
 	if (hashContext?.tag && options.sourcePath && seenLines) {

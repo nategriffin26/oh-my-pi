@@ -13,6 +13,7 @@ import type { FileSink } from "bun";
 import type { BashResult } from "../../exec/bash-executor";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
 import type { CacheWarmingMode } from "../../session/cache-warmer";
+import type { ClmReadTarget } from "../../session/clm-types";
 import type { SessionEntry, SessionTreeNode } from "../../session/session-entries";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameDecoder, type RpcProtocolVersion } from "./rpc-frame";
 import {
@@ -883,6 +884,18 @@ export class RpcClient {
 	 */
 	async setFollowUpMode(mode: "all" | "one-at-a-time"): Promise<void> {
 		await this.#send({ type: "set_follow_up_mode", mode });
+	}
+
+	/** Inspect effective context, status, or revision history, including while CLM is disabled. */
+	async getClmContext(target: ClmReadTarget = { kind: "status" }): Promise<string> {
+		const response = await this.#send({ type: "get_clm_context", target });
+		return this.#getData<{ text: string }>(response).text;
+	}
+
+	/** Restore a visible revision as a new revision. Requires enabled CLM and an idle session. */
+	async restoreClmContext(revision: string): Promise<string> {
+		const response = await this.#send({ type: "restore_clm_context", revision });
+		return this.#getData<{ text: string }>(response).text;
 	}
 
 	/**

@@ -9,6 +9,7 @@ import type {
 	TextContent,
 	Usage,
 } from "@oh-my-pi/pi-ai";
+import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { createSyntheticToolResultMessage } from "@oh-my-pi/pi-agent-core";
 import {
 	directoryIsEnterable,
@@ -41,10 +42,13 @@ import {
 	stripInternalDetailsFields,
 } from "./messages";
 import type { RetryFallbackRole } from "./retry-fallback-chains";
+import { DIAGNOSTIC_STATE, diagnosticInvalidationsForFork } from "../lsp/diagnostic-state";
+import { type ContextProjectionInput, getLatestContextProjectionEntry, ownContextProjection } from "./clm-state";
 import { type BuildSessionContextOptions, buildSessionContext, type SessionContext } from "./session-context";
 import {
 	type BranchSummaryEntry,
 	type CompactionEntry,
+	type ContextProjectionEntry,
 	type CredentialPinEntry,
 	CURRENT_SESSION_VERSION,
 	type CustomEntry,
@@ -379,13 +383,15 @@ function taskUsageFrom(details: unknown): Usage | undefined {
 	return maybeUsage !== null && typeof maybeUsage === "object" ? (maybeUsage as Usage) : undefined;
 }
 
-function entryUsage(entry: SessionEntry): Usage | undefined {
-	if (entry.type === "model_usage") return entry.usage;
-	if (entry.type !== "message") return undefined;
-	const message = entry.message;
+function messageUsage(message: AgentMessage): Usage | undefined {
 	if (message.role === "assistant") return message.usage;
 	if (message.role === "toolResult" && message.toolName === "task") return taskUsageFrom(message.details);
 	return undefined;
+}
+
+function entryUsage(entry: SessionEntry): Usage | undefined {
+	if (entry.type === "model_usage") return entry.usage;
+	return entry.type === "message" ? messageUsage(entry.message) : undefined;
 }
 
 /**
@@ -790,6 +796,7 @@ export class SessionManager {
 	#hasTitleSlot = true;
 	#entries: SessionEntry[] = [];
 	#index = new SessionEntryIndex();
+	#archiveRevision = 0;
 
 	/** File reflects all current entries; appends can go incrementally. */
 	#fileIsCurrent = false;
@@ -880,6 +887,8 @@ export class SessionManager {
 	#persistenceNoticeCallbacks = new Set<(notice: SessionPersistenceNotice) => void>();
 	/** Every notice raised so far, replayed to each later subscriber. */
 	#persistenceNotices: SessionPersistenceNotice[] = [];
+	/** The id each {@link #moveOffSessionFile} replaced, keyed by the id it minted: one conversation across sibling files. */
+	#movedFromSessionId = new Map<string, string>();
 	/**
 	 * This process's ownership claim on the file it last wrote (file storage
 	 * only). `release` is unset while another live process holds the file, and
@@ -1049,10 +1058,27 @@ export class SessionManager {
 			this.#index.insert(entry);
 			adopted++;
 		}
-		this.#index.setLeaf(leaf);
 		this.#expectedDiskSize = diskSize;
-		if (adopted > 0)
-			logger.warn("Kept session entries another writer added", { sessionFile: this.#sessionFile, adopted });
+		if (adopted === 0) {
+			this.#index.setLeaf(leaf);
+			return;
+		}
+		// Reload selects the final journal entry, which is now foreign. An empty marker on the
+		// active branch keeps a reopen on this session's branch (and its latest CLM projection).
+		const marker: BranchSummaryEntry = {
+			type: "branch_summary",
+			id: generateId(this.#index),
+			parentId: leaf,
+			timestamp: nowIso(),
+			fromId: leaf ?? "root",
+			summary: "",
+		};
+		this.#entries.push(marker);
+		this.#index.insert(marker);
+		this.#index.setLeaf(marker.id);
+		// Adopted CLM projections or managed diagnostics must keep their header requirements on republish.
+		this.#syncRequiredFeatures();
+		logger.warn("Kept session entries another writer added", { sessionFile: this.#sessionFile, adopted });
 	}
 
 	/**
@@ -1133,6 +1159,7 @@ export class SessionManager {
 		const previousSessionId = this.#sessionId;
 		const timestamp = nowIso();
 		this.#sessionId = mintSessionId();
+		this.#movedFromSessionId.set(this.#sessionId, previousSessionId);
 		const to = path.join(path.dirname(from), `${fileSafeTimestamp(timestamp)}_${this.#sessionId}.jsonl`);
 		this.#header = {
 			...this.#header,
@@ -1886,6 +1913,24 @@ export class SessionManager {
 		this.#index.rebuild(entries);
 	}
 
+	/** Header requirements name exactly the semantic readers the retained entries need. */
+	#syncRequiredFeatures(): void {
+		const requirements: Record<string, number> = {};
+		for (const entry of this.#entries) {
+			if (entry.type === "context_projection") {
+				requirements.contextProjection = 1;
+				if (
+					requirements.contextProjectionStrings === undefined &&
+					Object.hasOwn(prepareEntryForPersistence(entry, this.#blobs), "clmStringBlobs")
+				)
+					requirements.contextProjectionStrings = 1;
+			} else if (entry.type === "custom" && entry.customType === DIAGNOSTIC_STATE) {
+				requirements.managedDiagnostics = 1;
+			}
+		}
+		this.#header.requiredFeatures = Object.keys(requirements).length > 0 ? requirements : undefined;
+	}
+
 	#freshEntryFields(): { id: string; parentId: string | null; timestamp: string } {
 		return {
 			id: generateId(this.#index),
@@ -1932,9 +1977,16 @@ export class SessionManager {
 			return id;
 		};
 		const retained = this.#entries.filter(entry => !batch.entryIds.has(entry.id));
-		for (const entry of retained) entry.parentId = retainedAncestor(entry.parentId);
+		for (let i = 0; i < retained.length; i++) {
+			const entry = retained[i];
+			const parentId = retainedAncestor(entry.parentId);
+			if (parentId === entry.parentId) continue;
+			retained[i] =
+				entry.type === "context_projection" ? ownContextProjection({ ...entry, parentId }) : { ...entry, parentId };
+		}
 		const restoredLeaf = retainedAncestor(batch.externalLeafChanged ? batch.externalLeafId : batch.preBatchLeafId);
 		this.#entries = retained;
+		this.#syncRequiredFeatures();
 		this.#index.rebuild(retained);
 		this.#index.setLeaf(restoredLeaf && this.#index.has(restoredLeaf) ? restoredLeaf : null);
 	}
@@ -2273,6 +2325,7 @@ export class SessionManager {
 			additionalDirectories: this.#additionalDirectories.length > 0 ? [...this.#additionalDirectories] : undefined,
 			parentSession: parentSessionId,
 			providerPromptCacheKey: this.#header.providerPromptCacheKey ?? parentSessionId,
+			requiredFeatures: this.#header.requiredFeatures ? { ...this.#header.requiredFeatures } : undefined,
 		};
 		this.#sessionName = this.#header.title;
 		this.#titleSource = this.#header.titleSource;
@@ -2476,8 +2529,11 @@ export class SessionManager {
 		manager.#additionalDirectories = [...this.#additionalDirectories];
 		manager.#header.additionalDirectories =
 			manager.#additionalDirectories.length > 0 ? [...manager.#additionalDirectories] : undefined;
-		manager.#entries = structuredClone(this.#entries);
+		manager.#entries = structuredClone(this.#entries).map(entry =>
+			entry.type === "context_projection" ? ownContextProjection(entry) : entry,
+		);
 		manager.#index.rebuild(manager.#entries);
+		manager.#syncRequiredFeatures();
 		manager.#forceFileCreation = true;
 		await manager.#rewriteAtomically();
 		return manager;
@@ -2915,6 +2971,17 @@ export class SessionManager {
 		return this.#sessionId;
 	}
 
+	/**
+	 * Whether `sessionId` names this conversation: the current session, or one it left only
+	 * because persistence moved it to a sibling file. New, switched, and forked sessions start fresh.
+	 */
+	continuesSession(sessionId: string): boolean {
+		for (let id: string | undefined = this.#sessionId; id !== undefined; id = this.#movedFromSessionId.get(id)) {
+			if (id === sessionId) return true;
+		}
+		return false;
+	}
+
 	getSessionFile(): string | undefined {
 		return this.#sessionFile;
 	}
@@ -3133,7 +3200,23 @@ export class SessionManager {
 	 * `id`/`parentId`. Used by collab guests to mirror the host session.
 	 */
 	ingestReplicatedEntry(entry: SessionEntry): void {
-		this.#recordEntry(entry);
+		const owned = entry.type === "context_projection" ? ownContextProjection(entry) : entry;
+		if (owned.type === "context_projection") {
+			const persisted = prepareEntryForPersistence(owned, this.#blobs);
+			this.#header.requiredFeatures = {
+				...this.#header.requiredFeatures,
+				contextProjection: 1,
+				...(Object.hasOwn(persisted, "clmStringBlobs") ? { contextProjectionStrings: 1 } : {}),
+			};
+			this.#fileIsCurrent = false;
+			this.#rewriteRequired = true;
+		}
+		if (owned.type === "custom" && owned.customType === DIAGNOSTIC_STATE) {
+			this.#header.requiredFeatures = { ...this.#header.requiredFeatures, managedDiagnostics: 1 };
+			this.#fileIsCurrent = false;
+			this.#rewriteRequired = true;
+		}
+		this.#recordEntry(owned);
 	}
 
 	/**
@@ -3307,6 +3390,9 @@ export class SessionManager {
 			tokensAfter?: number;
 		} = {},
 	): string {
+		if (this.getLatestContextProjection() !== undefined) {
+			throw new Error("Legacy compaction cannot replace a CLM projection; commit a compact projection instead");
+		}
 		const entry: CompactionEntry<T> = {
 			type: "compaction",
 			...this.#freshEntryFields(),
@@ -3325,6 +3411,41 @@ export class SessionManager {
 		return entry.id;
 	}
 
+	appendContextProjection(projection: ContextProjectionInput): string {
+		const entry: ContextProjectionEntry = {
+			...projection,
+			type: "context_projection",
+			version: 1,
+			...this.#freshEntryFields(),
+		};
+		const branch = this.getBranch();
+		if (entry.coveredThroughEntryId !== null && !branch.some(source => source.id === entry.coveredThroughEntryId)) {
+			throw new Error("CLM coverage boundary is not on the active branch");
+		}
+		const owned = ownContextProjection(entry);
+		// Prepare before recording: serialization rejection must not publish a revision.
+		const persisted = prepareEntryForPersistence(owned, this.#blobs);
+		const spillsStrings = Object.hasOwn(persisted, "clmStringBlobs");
+		if (
+			this.#header.requiredFeatures?.contextProjection !== 1 ||
+			(spillsStrings && this.#header.requiredFeatures?.contextProjectionStrings !== 1)
+		) {
+			this.#fileIsCurrent = false;
+			this.#rewriteRequired = true;
+		}
+		this.#header.requiredFeatures = {
+			...this.#header.requiredFeatures,
+			contextProjection: 1,
+			...(spillsStrings ? { contextProjectionStrings: 1 } : {}),
+		};
+		this.#recordEntry(owned);
+		return owned.id;
+	}
+
+	getLatestContextProjection(): ContextProjectionEntry | undefined {
+		return getLatestContextProjectionEntry(this.getBranch()) ?? undefined;
+	}
+
 	/**
 	 * Append the durable conversation boundary recorded by `/clear`. The
 	 * collapsed live transcript and the model-context rebuild start after the
@@ -3339,8 +3460,17 @@ export class SessionManager {
 
 	appendCustomEntry(customType: string, data?: unknown): string {
 		const entry: CustomEntry = { type: "custom", customType, data, ...this.#freshEntryFields() };
+		if (customType === DIAGNOSTIC_STATE && this.#header.requiredFeatures?.managedDiagnostics !== 1) {
+			this.#header.requiredFeatures = { ...this.#header.requiredFeatures, managedDiagnostics: 1 };
+			this.#fileIsCurrent = false;
+		}
 		this.#recordEntry(entry);
 		return entry.id;
+	}
+
+	/** Invalidates archive snapshots after in-place journal rewrites, even when the leaf is unchanged. */
+	getArchiveRevision(): number {
+		return this.#archiveRevision;
 	}
 
 	/**
@@ -3348,6 +3478,7 @@ export class SessionManager {
 	 * outputs). Use sparingly.
 	 */
 	async rewriteEntries(): Promise<void> {
+		this.#archiveRevision++;
 		if (!this.#persist || !this.#sessionFile) return;
 		await this.#rewriteAtomically();
 	}
@@ -3622,9 +3753,22 @@ export class SessionManager {
 		const branchPath = this.getBranch(leafId);
 		if (branchPath.length === 0) throw new Error(`Entry ${leafId} not found`);
 
-		// Drop label entries from the path; recreate them fresh from the resolved map.
-		const entriesToKeep = branchPath.filter(entry => entry.type !== "label");
+		// Keep the complete parent chain, including labels used as projection coverage boundaries.
+		// Reset carried label values before replaying the currently resolved map below.
+		const entriesToKeep = branchPath.map(entry => (entry.type === "label" ? { ...entry, label: undefined } : entry));
 		const keptIds = new Set(entriesToKeep.map(entry => entry.id));
+		for (const data of diagnosticInvalidationsForFork(this.#entries, entriesToKeep)) {
+			const id = generateId(keptIds);
+			entriesToKeep.push({
+				type: "custom",
+				customType: DIAGNOSTIC_STATE,
+				data,
+				id,
+				parentId: entriesToKeep.at(-1)?.id ?? null,
+				timestamp: nowIso(),
+			});
+			keptIds.add(id);
+		}
 		const labelsToCarry: Array<{ targetId: string; label: string }> = [];
 		for (const [targetId, label] of this.#index.labelsInEffect()) {
 			if (keptIds.has(targetId)) labelsToCarry.push({ targetId, label });
@@ -3663,6 +3807,7 @@ export class SessionManager {
 
 		this.#header = header;
 		this.#entries = [...entriesToKeep, ...labels];
+		this.#syncRequiredFeatures();
 		this.#sessionId = newSessionId;
 		this.#sessionName = header.title;
 		this.#titleSource = header.titleSource;
@@ -3750,6 +3895,13 @@ export class SessionManager {
 			sessionFile?: string;
 			resetInheritedCost?: boolean;
 			repairInterruptedTail?: boolean;
+			/**
+			 * Drop the active branch's final assistant turn (and everything after it) when that turn
+			 * still has unresolved tool calls, so the fork ends at the last completed exchange. A
+			 * subagent forked by its parent's in-flight `task` call must not inherit that call as if
+			 * it were its own pending delegation.
+			 */
+			excludeInFlightTurn?: boolean;
 		},
 	): Promise<SessionManager> {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
@@ -3791,10 +3943,19 @@ export class SessionManager {
 		manager.#hasTitleSlot = true;
 		manager.#entries = history;
 		manager.#index.rebuild(history);
+		const settled = options?.excludeInFlightTurn
+			? SessionManager.#withoutForkedInFlightTurn(history, manager.#index.pathTo())
+			: undefined;
+		if (settled) {
+			manager.#entries = settled.entries;
+			manager.#index.rebuild(settled.entries);
+			manager.#index.setLeaf(settled.leafId);
+		}
+		manager.#syncRequiredFeatures();
 		manager.sanitizeLoadedOpenAIResponsesReplayMetadata();
 		if (options?.repairInterruptedTail) {
-			SessionManager.#repairForkedInterruptedTail(history, manager.#index.pathTo());
-			manager.#index.rebuild(history);
+			SessionManager.#repairForkedInterruptedTail(manager.#entries, manager.#index.pathTo());
+			manager.#index.rebuild(manager.#entries);
 		}
 		manager.#forceFileCreation = true;
 		await manager.#rewriteAtomically();
@@ -3816,7 +3977,69 @@ export class SessionManager {
 	 * on them — since only billing attribution is inherited, not context size.
 	 */
 	static #resetInheritedUsageCost(history: SessionEntry[]): void {
-		for (const entry of history) resetUsageCost(entryUsage(entry));
+		for (let i = 0; i < history.length; i++) {
+			const entry = history[i];
+			resetUsageCost(entryUsage(entry));
+			if (entry.type === "context_projection") {
+				// Hydrated projections are immutable; replace the owned snapshot after resetting its copy.
+				const projection = structuredClone(entry);
+				for (const message of projection.messages) resetUsageCost(messageUsage(message));
+				history[i] = ownContextProjection(projection);
+			}
+		}
+	}
+
+	/**
+	 * The forked history without the active branch's in-flight assistant turn: the final
+	 * assistant message not superseded by a projection/reset, whose tool calls are not all
+	 * resolved by subsequent results, plus every entry descending from it. `undefined` when
+	 * already settled. Resume at its parent, adding an empty branch marker only when needed
+	 * to preserve that selection through journal reload.
+	 */
+	static #withoutForkedInFlightTurn(
+		history: readonly SessionEntry[],
+		branch: readonly SessionEntry[],
+	): { entries: SessionEntry[]; leafId: string | null } | undefined {
+		const turnIndex = branch.findLastIndex(entry => entry.type === "message" && entry.message.role === "assistant");
+		const turn = branch[turnIndex];
+		if (turn?.type !== "message" || turn.message.role !== "assistant") return undefined;
+		// A completed projection or reset may supersede an unresolved raw turn. Do not
+		// resurrect its deleted history by cutting away the boundary that replaced it.
+		const projection = getLatestContextProjectionEntry(branch);
+		const coveredIndex = projection?.coveredThroughEntryId
+			? branch.findIndex(entry => entry.id === projection.coveredThroughEntryId)
+			: -1;
+		if (coveredIndex >= turnIndex || branch.findLastIndex(entry => entry.type === "reset_boundary") > turnIndex)
+			return undefined;
+		const resolved = new Set<string>();
+		for (let index = turnIndex + 1; index < branch.length; index++) {
+			const entry = branch[index];
+			if (entry.type === "message" && entry.message.role === "toolResult") resolved.add(entry.message.toolCallId);
+		}
+		if (!turn.message.content.some(block => block.type === "toolCall" && !resolved.has(block.id))) return undefined;
+		// Entries are append-ordered, so a descendant always follows its parent.
+		const dropped = new Set([turn.id]);
+		const entries = history.filter(entry => {
+			if (entry.parentId === null || !dropped.has(entry.parentId)) return !dropped.has(entry.id);
+			dropped.add(entry.id);
+			return false;
+		});
+		let leafId = turn.parentId;
+		if ((entries.at(-1)?.id ?? null) !== leafId) {
+			// Reload selects the final journal entry. Keep retained sibling history without
+			// letting it become the fork's active branch when the child is reopened.
+			const marker: BranchSummaryEntry = {
+				type: "branch_summary",
+				id: generateId(new Set(entries.map(entry => entry.id))),
+				parentId: leafId,
+				timestamp: nowIso(),
+				fromId: leafId ?? "root",
+				summary: "",
+			};
+			entries.push(marker);
+			leafId = marker.id;
+		}
+		return { entries, leafId };
 	}
 
 	/**

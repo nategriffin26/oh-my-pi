@@ -80,7 +80,7 @@ export const TAB_GROUPS: Record<SettingTab, readonly string[]> = {
 		"Git",
 		"Skills",
 	],
-	context: ["General", "Compaction", "Rules (TTSR)", "Experimental"],
+	context: ["General", "Compaction", "Context document", "Rules (TTSR)", "Experimental"],
 	memory: ["General", "Auto-Learn", "Mnemopi", "Hindsight", "Sharpshooter"],
 	files: ["Editing", "Reading", "Read Summaries", "LSP"],
 	shell: ["Bash", "Eval & Runtimes"],
@@ -122,6 +122,8 @@ export interface UiBase {
 	warning?: string;
 	/** Condition function name - setting only shown when true */
 	condition?: string;
+	/** Condition function name - setting stays listed but renders dim while false (it has no effect then) */
+	dimUnless?: string;
 }
 
 /** Wide ui shape exposed to consumers that walk the schema generically. */
@@ -130,6 +132,15 @@ export type AnyUiMetadata = UiBase & {
 	secret?: boolean;
 	ordered?: boolean;
 };
+
+/**
+ * A row that stands for another setting instead of storing a value: it shows `value()` (derived
+ * from the settings it reflects) and Enter edits the submenu setting `target()` names in place.
+ */
+export interface SettingsLink {
+	value(): string;
+	target(): string;
+}
 
 /** Structural schema entries supplied by the application host. */
 export interface SettingsDisplayEntry {
@@ -140,6 +151,9 @@ export interface SettingsDisplayEntry {
 	enumValues?: readonly string[];
 	credential?: boolean;
 	condition?: () => boolean;
+	dimUnless?: () => boolean;
+	/** Set for a {@link SettingsLink} row; `path` is then a row id, not a stored setting. */
+	link?: SettingsLink;
 }
 
 export interface SettingsHost {
@@ -175,6 +189,12 @@ interface BaseSettingDef {
 	 * enums, submenus, and text inputs.
 	 */
 	condition?: () => boolean;
+	/**
+	 * Optional effect predicate. When supplied and returning false, the setting
+	 * stays listed and editable but renders dim: it has no effect until the
+	 * setting it depends on is enabled.
+	 */
+	dimUnless?: () => boolean;
 }
 
 export interface BooleanSettingDef extends BaseSettingDef {
@@ -211,13 +231,19 @@ export interface MultiSelectSettingDef extends BaseSettingDef {
 	ordered: boolean;
 }
 
+/** A {@link SettingsLink} row: no stored value; Enter opens the target setting's submenu. */
+export interface LinkSettingDef extends BaseSettingDef, SettingsLink {
+	type: "link";
+}
+
 export type SettingDef =
 	| BooleanSettingDef
 	| EnumSettingDef
 	| SubmenuSettingDef
 	| TextInputSettingDef
 	| ProviderLimitsSettingDef
-	| MultiSelectSettingDef;
+	| MultiSelectSettingDef
+	| LinkSettingDef;
 
 function resolveOptions(ui: AnyUiMetadata): OptionList | "runtime" | undefined {
 	if (!ui.options) return undefined;
@@ -241,7 +267,13 @@ function entryToSettingDef(entry: SettingsDisplayEntry): SettingDef | null {
 		tab: ui.tab,
 		group: ui.group,
 		condition,
+		dimUnless: entry.dimUnless,
 	};
+
+	if (entry.link) {
+		const { value, target } = entry.link;
+		return { ...base, type: "link", value, target };
+	}
 
 	if (schemaType === "boolean") {
 		return { ...base, type: "boolean" };

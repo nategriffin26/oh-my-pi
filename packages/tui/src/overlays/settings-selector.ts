@@ -907,6 +907,7 @@ export class SettingsSelectorComponent implements Component {
 	/** Whether row `id`'s choices fit its popup menu (else the submenu opens as a picker over the page). */
 	#inlineMenu(id: string): boolean {
 		const def = getSettingDef(this.#context.settings.entries, id);
+		if (def?.type === "link") return false;
 		return def?.type !== "submenu" || this.#submenuOptions(def).length <= PREFS_MENU_MAX;
 	}
 
@@ -950,6 +951,8 @@ export class SettingsSelectorComponent implements Component {
 				};
 			case "providerLimits":
 				return { k: "action", label: "Edit…", act: "edit" };
+			case "link":
+				return { k: "action", label: shown, act: "edit" };
 			case "multiselect":
 				return {
 					k: "multi",
@@ -1051,7 +1054,8 @@ export class SettingsSelectorComponent implements Component {
 		value: boolean | number | string | readonly string[] | null,
 	): void {
 		const def = getSettingDef(this.#context.settings.entries, id);
-		if (!def) return;
+		// A link row stores nothing to set or reset; its editor (the target's submenu) opens via `edit`.
+		if (!def || def.type === "link") return;
 		if (value === null) {
 			if (list.openSubmenu) list.handleInput(ESCAPE);
 			this.#context.settings.unset(def.path);
@@ -1462,6 +1466,7 @@ export class SettingsSelectorComponent implements Component {
 			warning: def.warning,
 			changed,
 			defaultLabel: changed ? this.#defaultLabel(def) : undefined,
+			inactive: def.dimUnless && !def.dimUnless() ? true : undefined,
 		};
 
 		switch (def.type) {
@@ -1498,7 +1503,26 @@ export class SettingsSelectorComponent implements Component {
 					currentValue: this.#formatMultiSelectValue(def, currentValue),
 					submenu: (_cv, done) => this.#createMultiSelect(def, done),
 				};
+			case "link":
+				return {
+					...item,
+					currentValue: def.value(),
+					submenu: (_cv, done) => this.#createLinkedSubmenu(def, done),
+				};
 		}
+	}
+
+	/** A link row's editor: the submenu of the setting it currently stands for, which persists the choice. */
+	#createLinkedSubmenu(def: SettingDef & { type: "link" }, done: (value?: string) => void): Component {
+		const target = getSettingDef(this.#context.settings.entries, def.target());
+		if (target?.type !== "submenu") {
+			throw new Error(`Settings link ${def.path} targets ${def.target()}, which is not a choice setting`);
+		}
+		return this.#createSubmenu(
+			target,
+			this.#getSubmenuCurrentValue(target.path, this.#getCurrentValue(target)),
+			done,
+		);
 	}
 
 	/**
@@ -1509,6 +1533,7 @@ export class SettingsSelectorComponent implements Component {
 	}
 
 	#isChanged(def: SettingDef, currentValue: unknown): boolean {
+		if (def.type === "link") return false;
 		const defaultValue: unknown = def.defaultValue;
 		if (Array.isArray(currentValue) && Array.isArray(defaultValue)) {
 			return (

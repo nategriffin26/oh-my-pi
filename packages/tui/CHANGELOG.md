@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `ContextInspector`, the fullscreen read-only `/context` overlay (Blocks, History, Archive tabs; split list/detail at 100+ columns, stacked below), and the `dividerOpenSplit()` overlay-box rule that opens a two-column section.
+
 ## [18.4.9] - 2026-10-01
 
 ### Added

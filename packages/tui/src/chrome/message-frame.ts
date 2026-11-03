@@ -43,6 +43,8 @@ export interface FramedMessageOptions<M extends FramedMessage> {
 	readonly icon?: string | (() => string);
 	/** Hide the default type header while retaining the message body. */
 	readonly hideHeader?: boolean | (() => boolean);
+	/** Dim provenance shown after the type tag (e.g. `model-authored · <revision>`). */
+	readonly detail?: string;
 	/** Semantic color for the outline, defaulting to the muted border. */
 	readonly borderColor?: ThemeColor;
 	/** Collapse the markdown body to this many lines when `expanded` is false. Omit to never collapse. */
@@ -112,7 +114,12 @@ export class FramedMessageComponent<M extends FramedMessage> extends Container {
 				{
 					role: this.#options.role,
 					tone: colorTone(this.#options.borderColor),
-					head: hideHeader ? undefined : [span(tag, "customMessageLabel strong")],
+					head: hideHeader
+						? undefined
+						: [
+								span(tag, "customMessageLabel strong"),
+								...(this.#options.detail ? [span(` · ${this.#options.detail}`, "dim")] : []),
+							],
 					collapsible: collapseAfterLines !== undefined,
 					collapsed: collapseAfterLines !== undefined ? !this.#expanded : undefined,
 					preview: collapseAfterLines !== undefined ? { lines: collapseAfterLines } : undefined,
@@ -185,7 +192,8 @@ export class FramedMessageComponent<M extends FramedMessage> extends Container {
 		if (!hideHeader) {
 			const icon = typeof this.#options.icon === "function" ? this.#options.icon() : this.#options.icon;
 			const tag = icon ? `${icon} ${this.#options.message.customType}` : this.#options.message.customType;
-			this.#box.addChild(new Text(theme.fg("customMessageLabel", theme.bold(tag)), 0, 0));
+			const detail = this.#options.detail ? theme.fg("dim", ` · ${this.#options.detail}`) : "";
+			this.#box.addChild(new Text(`${theme.fg("customMessageLabel", theme.bold(tag))}${detail}`, 0, 0));
 			this.#box.addChild(new Spacer(1));
 		}
 

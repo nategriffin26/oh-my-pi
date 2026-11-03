@@ -38,7 +38,7 @@ export function contextLocalProtocolOptions(session: ToolSession): LocalProtocol
 /** The single ResolveContext builder for a tool session; replaces per-tool literal assembly. */
 export function sessionResolveContext(
 	session: ToolSession,
-	options: { signal?: AbortSignal; skipDirectoryListing?: boolean } = {},
+	options: { signal?: AbortSignal; skipDirectoryListing?: boolean; continuesLines?: boolean } = {},
 ): ResolveContext {
 	return {
 		cwd: session.cwd,
@@ -54,6 +54,7 @@ export function sessionResolveContext(
 		rules: session.activeRules,
 		session,
 		skipDirectoryListing: options.skipDirectoryListing,
+		continuesLines: options.continuesLines,
 	};
 }
 

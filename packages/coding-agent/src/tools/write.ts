@@ -799,7 +799,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 					// scheme is coordination (peer messages) or a device (which keeps each
 					// dispatched tool's own tier and policy).
 					if (policy?.scope !== "device") {
-						if (policy?.scope !== "coordination") {
+						if (policy?.scope !== "coordination" && policy?.scope !== "sandbox") {
 							await enforcePlanModeWrite(this.session, path, { op: "update", signal });
 						}
 						emitWriteProgress(onUpdate, cleanContent, path);

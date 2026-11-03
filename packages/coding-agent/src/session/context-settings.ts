@@ -75,6 +75,86 @@ export const cfgCompactionExperimentalContextManagement = register({
 	},
 });
 
+// Context document (CLM)
+export const cfgCompactionExperimentalClm = register({
+	id: "compaction.experimentalClm",
+	type: "boolean",
+	default: false,
+	ui: {
+		tab: "context",
+		group: "Context document",
+		label: "Enabled (experimental)",
+		description:
+			"Let the model manage completed context through a transactional context document. Soft limit, recall and handoff apply only while enabled.",
+	},
+});
+
+export const cfgCompactionClmRecallRerank = register({
+	id: "compaction.clmRecallRerank",
+	type: "enum",
+	values: ["jev", "lexical"] as const,
+	default: "jev",
+	ui: {
+		tab: "context",
+		group: "Context document",
+		label: "Recall rerank",
+		description:
+			"How context://self/archive?q= and context://parent/archive?q= rank hits. Jev reranks the lexical shortlist with the native judge when one is available; Lexical always uses BM25 order and never calls the judge",
+		options: [
+			{ value: "jev", label: "Jev", description: "Rerank with the native judge when available" },
+			{ value: "lexical", label: "Lexical", description: "BM25 order only; never call the judge" },
+		],
+		dimUnless: "clmEnabled",
+	},
+});
+
+export const cfgCompactionClmHandoffDefault = register({
+	id: "compaction.clmHandoffDefault",
+	type: "enum",
+	values: ["curated", "brief", "fork"] as const,
+	default: "curated",
+	ui: {
+		tab: "context",
+		group: "Context document",
+		label: "Handoff default",
+		description:
+			"Handoff mode for task items that omit handoffMode. Fork falls back to curated for independent agents (reviewers, verifiers), which never receive the parent transcript",
+		options: [
+			{
+				value: "curated",
+				label: "Curated",
+				description: "Selected archive items, pinned user requests, and a manifest",
+			},
+			{
+				value: "brief",
+				label: "Brief",
+				description: "Assignment and shared context only; parent archive stays readable",
+			},
+			{ value: "fork", label: "Fork", description: "The parent's transcript up to its last completed exchange" },
+		],
+		dimUnless: "clmEnabled",
+	},
+});
+
+export const cfgCompactionClmShowContextEdits = register({
+	id: "compaction.clmShowContextEdits",
+	type: "enum",
+	values: ["card", "off"] as const,
+	default: "card",
+	ui: {
+		tab: "context",
+		group: "Context document",
+		label: "Show context edits",
+		description:
+			"Card renders each committed context edit as a receipt card in the transcript; Off keeps only the dim status receipt",
+		options: [
+			{ value: "card", label: "Card", description: "Receipt card per committed context edit" },
+			{ value: "off", label: "Off", description: "Dim status receipt only" },
+		],
+		dimUnless: "clmEnabled",
+	},
+});
+
 export const cfgCompactionMidTurnEnabled = register({
 	id: "compaction.midTurnEnabled",
 	type: "boolean",
@@ -304,6 +384,7 @@ export const cfgCompactionDropUseless = register({
 export const cfgCompaction = combine({
 	enabled: cfgCompactionEnabled,
 	experimentalContextManagement: cfgCompactionExperimentalContextManagement,
+	experimentalClm: cfgCompactionExperimentalClm,
 	methodOrder: cfgCompactionMethodOrder,
 	thresholdPercent: cfgCompactionThresholdPercent,
 	thresholdTokens: cfgCompactionThresholdTokens,

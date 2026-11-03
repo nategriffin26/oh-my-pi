@@ -15,6 +15,11 @@ import { cfgAutolearnEnabled } from "../autolearn/settings";
 import { cfgMemoryBackend } from "../memory-backend/settings";
 import { cfgTuiVimMode } from "../modes/settings";
 import { cfgAdvisorEnabled } from "../advisor/settings";
+import {
+	cfgCompactionExperimentalClm,
+	cfgCompactionThresholdPercent,
+	cfgCompactionThresholdTokens,
+} from "../session/context-settings";
 
 /** Condition over the global settings; hidden (false) until they are initialized. */
 function whenSettings(test: (settings: Settings) => boolean): () => boolean {
@@ -33,6 +38,7 @@ const CONDITIONS: Record<string, () => boolean> = {
 	usageAwareFallbackEnabled: whenSettings(s => cfgRetryUsageAwareFallback.get(s) === true),
 	planModeEnabled: whenSettings(s => cfgPlanEnabled.get(s)),
 	planAutosaveEnabled: whenSettings(s => cfgPlanEnabled.get(s) && cfgPlanAutosave.get(s)),
+	clmEnabled: whenSettings(s => cfgCompactionExperimentalClm.get(s) === true),
 };
 
 /** Description suffix telling the panel user that an environment variable is in play. */
@@ -42,6 +48,37 @@ function envNote(setting: AnySetting): string {
 		? ` Unset, it falls back to $${setting.envName}.`
 		: ` $${setting.envName} overrides this setting while it is set.`;
 }
+
+/**
+ * `Context document` → Soft limit: the CLM soft limit *is* the compaction threshold, so the row
+ * stores nothing. It names the threshold setting in force (a token limit overrides the percent)
+ * and Enter edits that setting in place.
+ */
+const clmSoftLimitEntry: SettingsDisplayEntry = {
+	path: "clm.softLimit",
+	type: "link",
+	defaultValue: undefined,
+	ui: {
+		tab: "context",
+		group: "Context document",
+		label: "Soft limit",
+		description:
+			"Where the model is told to edit its context document: the Compaction Token Limit when set, else the Compaction Threshold. Enter edits that setting.",
+	},
+	dimUnless: CONDITIONS.clmEnabled,
+	link: {
+		value: () => {
+			const tokens = cfgCompactionThresholdTokens.layered(settings);
+			if (tokens > 0) return `= Compaction Token Limit (${tokens})`;
+			const percent = cfgCompactionThresholdPercent.layered(settings);
+			return `= Compaction Threshold (${percent > 0 ? `${percent}%` : "default"})`;
+		},
+		target: () =>
+			cfgCompactionThresholdTokens.layered(settings) > 0
+				? cfgCompactionThresholdTokens.id
+				: cfgCompactionThresholdPercent.id,
+	},
+};
 
 /**
  * Adapt the application schema and settings store to the terminal overlay. The panel shows and
@@ -63,7 +100,9 @@ export function createSettingsHost(): SettingsHost {
 				enumValues: setting.enumValues,
 				credential: setting.isCredential,
 				condition: ui.condition ? CONDITIONS[ui.condition] : undefined,
+				dimUnless: ui.dimUnless ? CONDITIONS[ui.dimUnless] : undefined,
 			});
+			if (setting.id === cfgCompactionExperimentalClm.id) entries.push(clmSoftLimitEntry);
 		}
 	}
 	const resolve = (path: string): AnySetting => {
